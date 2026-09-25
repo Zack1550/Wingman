@@ -3,17 +3,11 @@
 A natural-language mission orchestrator for simulated multirotor aircraft, built
 against ArduPilot SITL. 
 
-End goal: A single natural-language fleet orchestrator
-capable of running single craft or a fleet.
+End goal: A single natural-language fleet orchestrator capable of running single craft or a fleet.
 
 Scoping limits: As a personal project the harness will only manage
 a "fleet" consisting of a rover and multirotor aircraft.
 
-You describe a mission in English. A model turns it into a **plan** — ordered
-steps with exact arguments, as data rather than prose. A human approves each
-risky command. A separate executor runs only what was approved, over a
-**UDP/protobuf gateway** whose link can be made to drop, duplicate, reorder and
-delay. Nothing claims success that telemetry did not show.
 
 ```
   you ──► planner ──► a plan, as data       the model proposes.
@@ -50,24 +44,17 @@ delay. Nothing claims success that telemetry did not show.
                                    └─► copter_2 (sysid 2)
 ```
 
-There is a second, simpler route: `harness/run.py` puts a model in a loop where
-it calls the MCP tools directly, guarded by step, tool-call and deadline
-budgets. That path has no approval gate — it is for watching a model work, not
-for flying anything you'd be sad to lose.
-
----
-
 ## How it works
 
 Give the system a mission in plain English. A model turns that into a
 **plan** — an ordered list of steps, each naming an exact tool with exact
-arguments, emitted as structured data rather than prose. That distinction is the
+arguments, emitted as structured data rather than prose. This distinction is the
 hinge the whole design turns on: a plan in prose can be read multiple ways, and a
 permission granted against it means imprecise execution. A plan as data has one
 reading, so a human can approve one specific command and the system can later
 prove that only that command ran. The planner is given the aircraft's current
 state before it plans. Every generated step is validated against the tool's schema
-before an operator is asked to approve anything.
+before an operator is asked to approve anything to prevent operator overload.
 
 Underneath sits a **UDP/protobuf gateway** that is the only component speaking
 MAVLink. Everything above it deals in `VehicleCommand` and `VehicleTelemetry`
@@ -83,23 +70,23 @@ airborne.
 The gateway's link can be made to **drop, duplicate, reorder and delay**, because
 a harness that has only run over loopback has never been tested. When an
 acknowledgement goes missing, the correct behaviour is neither to retry nor to
-report failure: the outcome is genuinely *unknown*, and unknown is a state the
-system reports rather than a coin it flips. The client asks the gateway what it
+report failure: the outcome is genuinely *unknown*, and unknown is a treated as
+a first class state system reports. The client asks the gateway what it
 recorded for that specific `operation_id` and gets the original acknowledgement
 back verbatim — a lookup by key, not an inference from a state change, which
-matters the moment two things can command one aircraft. In a recorded mission
-the aircraft was already descending 1.6 seconds after the command while the
-harness did not learn its command had landed for six more seconds. That window
-is not an error condition; it is the normal state of a distributed system, and
-every safety property here is designed to survive it.
+matters the moment two things can command one aircraft. 
+
+Note:
+> In a recorded mission the aircraft was already descending 1.6 seconds after the command while the harness did not learn its command had landed for six more seconds. That window
+is not an error condition; it is the normal state of a distributed system, and every
+safety property here is designed to survive it.
 
 There are **two routes from a model to an aircraft**, and they differ in what
-stands between intent and action. The agent loop lets a model call tools
+stands between intent and action. The agent loop allows a model call tools
 directly, guarded by step, tool-call and deadline budgets, with argument
 validation and unknown-tool rejection returning structured errors the model can
 recover from rather than exceptions that kill the run. The plan path adds a
-human: constraints are checked *before* the operator is asked — a prompt for
-something the system will refuse anyway teaches people to click through — and
+human: constraints are checked *before* the operator is asked and
 approval binds to the tool, the canonical arguments, the telemetry version it was
 proposed against, an expiry and the `operation_id` it will use. That binding is
 re-checked immediately before dispatch, because a person takes seconds to read a
@@ -118,8 +105,6 @@ that evidence rather than from the model's closing paragraph: 149 layer-one test
 run in 20 seconds against an in-process fake gateway with no Docker, and twelve
 end-to-end missions grade to three verdicts — pass, correctly declined, or fail —
 because a refusal only counts if the reason it gave was true.
-
----
 
 ## Quick start
 
@@ -153,20 +138,10 @@ python -m evals.runner --provider anthropic --model claude-sonnet-5
 python -m evals.report --markdown
 ```
 
----
-
-## What it does, against what the role describes
-
-| Described publicly | This build | Honest gap |
-|---|---|---|
-| Reads platform docs and tool definitions, emits vehicle-native commands | MCP tool server → UDP/protobuf gateway → pymavlink → SITL | One vehicle type, one API I defined myself. No document retrieval yet |
-| Builds a mission plan, submits for commander approval | Planner emits a schema-conformant plan; approval binds to canonical arguments, telemetry `state_version` and an expiry | CLI approval, not a C2 UI |
-| Tasks each asset, monitors, re-plans in real time | Executor with a SQLite ledger, telemetry readback, bounded retries | Seconds-scale polling; missions are sequential, not concurrent |
-| Enforces fleet constraints and operational authorities | Geofence, altitude cap, fleet separation, arm-requires-approval — enforced in code both paths reach | No authority model; one operator, one role |
-| Runs at the edge under degraded comms | Link can drop, duplicate, reorder and delay; the harness reconciles a lost ack rather than guessing. Same harness runs on Ollama offline | A laptop, not hardened compute |
-| Nightly retrain on mission logs (Foxglove / MCAP) | Agent steps and telemetry to MCAP, opened in Foxglove | Data preparation only — no fine-tuning was performed |
-
----
+#### Shortcut
+`harness/run.py` puts a model in a loop where it calls the MCP tools directly, guarded by step,
+tool-call and deadline budgets. That path has no approval gate — it is for watching a model work. 
+**Avoid flying anything you'd be sad to lose.**
 
 ## Results
 
@@ -208,8 +183,6 @@ Outcome assertions alone would score a correct refusal as a failure. They would
 also pass a model that reached the right altitude having claimed to observe it
 from a reading of 9.93 m, which is why `observed_arrival` checks that *some tool
 actually saw the aircraft near the target*, whatever the prose says.
-
----
 
 ## The lost acknowledgement
 
@@ -253,53 +226,26 @@ Three properties follow, and each is enforced rather than hoped for:
 - **`unknown` is a first-class outcome.** Silence is not failure. A write that
   cannot be resolved is reported as unknown and the model is told not to guess.
 
-Open the log yourself: [app.foxglove.dev](https://app.foxglove.dev) → Open local
+Opening the log: [app.foxglove.dev](https://app.foxglove.dev) → Open local
 file → `captures/mission.mcap`. Add a Plot panel on
 `/copter_1/state.altitude_m` and a Log panel on `/agent/log`, then drag the
 playhead to where the altitude starts falling.
 
----
-
-## Layout
-
-| Path | Lines | |
-|---|---|---|
-| `vehicle_gateway/gateway.py` | 884 | UDP/protobuf ⇄ MAVLink. Dedup ledger, per-vehicle `state_version`, link fault injection, telemetry fan-out |
-| `vehicle_gateway/client.py` | 356 | The coping half: `operation_id` generation, send → timeout → status-query reconciliation, telemetry freshness |
-| `vehicle_gateway/protos/vehicle.proto` | 109 | The wire contract |
-| `mcp_server/server.py` | 494 | 13 MCP tools over stdio. Docstrings are prompts; `op_id` is not model-facing |
-| `harness/planner.py` | 293 | Model proposes a plan as data, validated against real tool schemas |
-| `harness/approval.py` | — | The gate. Nothing a model writes reaches it |
-| `harness/executor.py` | 363 | Runs approved steps; re-checks the binding immediately before dispatch |
-| `harness/store.py` | 320 | SQLite: `proposed → awaiting_approval → submitted → applied \| failed \| unknown` |
-| `harness/constraints.py` | 219 | Geofence, ceiling, fleet separation — checked before the operator is asked |
-| `harness/loop.py` | 173 | Provider-agnostic agent loop with step, tool-call and deadline guards |
-| `evals/` | — | Two layers, three verdicts, offline re-grading |
-| `observability/` | — | Telemetry capture and MCAP builder |
-
-**149 layer-one tests** run in ~20 s with no Docker, against an in-process fake
-gateway. Eight more run against live SITL under `pytest -m live`.
-
----
-
-## Design decisions worth defending
+## Design decisions
 
 **Constraints are checked before the operator is asked.** A prompt for something
-the system will refuse anyway teaches people to click through prompts. There is
-a test named for it.
+the system will refuse anyway teaches people to click through prompts.
 
 **Approval binds to the exact command.** Tool, canonical arguments, the
 telemetry `state_version` it was proposed against, an expiry, and the
 `operation_id` it will use. Any change invalidates it, and the binding is
 re-checked at dispatch — a human takes seconds to read a prompt, and the
-aircraft does not pause for them.
+aircraft does not pause for those seconds.
 
 **A rejection ends the run.** Not skip-and-continue, not ask-differently.
 
-**Tolerances live in tools, not in arguments.** Offered a `min`/`max` band for a
-45 m target, a model chose 40–50 and reported success at 40.6 m while still
-climbing. `ALTITUDE_TOLERANCE_M` is a module constant; the model passes the
-target it was given.
+**Acceptance tolerances live in tools, not in arguments.** Models can infer success from
+data projections, widening the acceptance range, and hallucination.
 
 **Timeouts are derived from a measurement.** This stack stalls ~3.3 s every
 ~34 s — measured with a bare pymavlink listener and no gateway running, so it is
@@ -310,8 +256,6 @@ WSL2/Docker/SITL and not this code. Every timeout sits above that floor;
 path against roughly $0.12 on the agent loop, because the loop resends the whole
 conversation every step while the plan path calls the model twice. An 8×
 difference from an architecture choice rather than a model choice.
-
----
 
 ## Known gaps
 
@@ -333,25 +277,8 @@ difference from an architecture choice rather than a model choice.
 - **Claim-grounding is structural, not semantic.** `cites_observed_value` cannot
   distinguish a restated target from a claimed achievement; that wants an LLM
   judge over the trace.
-- **No document retrieval** and **no fine-tuning** — see the gaps table above.
+- **No document retrieval** and **no fine-tuning**.
 - One vehicle type, one API I defined myself, and a laptop.
-
----
-
-## What I would do next
-
-1. Persist the gateway ledger and add reconnection, so a gateway restart is
-   survivable rather than merely loud.
-2. Per-vehicle execution lanes, so a fleet mission is concurrent rather than
-   ordered.
-3. A battery-and-range constraint, so the aircraft's endurance is enforced in
-   code instead of left to the model's judgement.
-4. An LLM judge over traces for semantic claim-grounding, scored against the
-   structural checks to see where they disagree.
-5. Retrieval as a tool, with a planted document proving that retrieval supplies
-   context and never authority.
-
----
 
 ## Attribution
 
@@ -372,7 +299,7 @@ Models: `claude-sonnet-5`, `claude-opus-5`, `granite4.1:3b` (local, via Ollama).
 
 
 #### Lessons learned
-Nearly every serious bug turned out to be the same mistake in different clothes: something reporting an outcome it had never verified. The gateway kept broadcasting an aircraft's last-known state after its own uplink died. The executor stamped a read as success without inspecting what came back, so a mission whose confirming step returned gateway_unavailable reported completed. The eval reset slept eight seconds and hoped the simulator was ready; stop_gateway sent a signal and assumed the port was free. I spent two days criticising models for claiming success telemetry hadn't shown them, and found the identical error four times in my own code — which is the honest version of "prompts ask, code guarantees." The corollary was that the highest-leverage change all weekend wasn't a prompt at all: rewriting one rejection from "vehicle answered FAILED to arm" to "cannot arm while in RTL; set_mode to GUIDED first" turned a model that retried blindly and gave up into one that recovered on the next step. Same model, same prompt — better words from the machine.
+- Nearly every serious bug turned out to be the same mistake in different clothes: something reporting an outcome it had never verified. The gateway kept broadcasting an aircraft's last-known state after its own uplink died. The executor stamped a read as success without inspecting what came back, so a mission whose confirming step returned gateway_unavailable reported completed. The eval reset slept eight seconds and hoped the simulator was ready; stop_gateway sent a signal and assumed the port was free. I spent two days criticising models for claiming success telemetry hadn't shown them, and found the identical error four times in my own code — which is the honest version of "prompts ask, code guarantees." The highest-leverage change all wasn't a prompt at all: rewriting one rejection from "vehicle answered FAILED to arm" to "cannot arm while in RTL; set_mode to GUIDED first" turned a model that retried blindly and gave up into one that recovered on the next step. Same model, same prompt — better words from the machine.
 
-#### Interesting things.
-A link that died every 33 seconds turned out not to be my code: the simulator stack stalls ~3.3 s every ~34 s, reproducible with a bare pymavlink listener and no gateway running, which meant every timeout I'd chosen as a round number sat below the transport's actual floor. Given a min/max band to pick for a 45 m target, a model chose 40–50 and declared success at 40.6 m while still climbing — so tolerance moved out of the arguments and into the tool as a constant. Two frontier models given identical evidence disagreed about whether to fly a 0%-battery aircraft: one refused, cross-checked the second vehicle to rule out a broken field, and offered alternatives; the other flew it. And the local 3B model's failures weren't where I expected — it drove tools competently one at a time and failed at planning, five of nine failures producing no usable plan at all.
+#### Interesting things
+- A link that died every 33 seconds turned out not to be my code: the simulator stack stalls ~3.3 s every ~34 s, reproducible with a bare pymavlink listener and no gateway running, which meant every timeout I'd chosen as a round number sat below the transport's actual floor. Given a min/max band to pick for a 45 m target, a model chose 40–50 and declared success at 40.6 m while still climbing — so tolerance moved out of the arguments and into the tool as a constant. Two frontier models given identical evidence disagreed about whether to fly a 0%-battery aircraft: one refused, cross-checked the second vehicle to rule out a broken field, and offered alternatives; the other flew it. And the local 3B model's failures weren't where I expected — it drove tools competently one at a time and failed at planning, five of nine failures producing no usable plan at all.
