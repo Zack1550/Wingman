@@ -1,0 +1,109 @@
+syntax = "proto3";
+package vehicle;
+
+// --- Commands: intent, in units a human or a model can reason about. -------
+// Translating to MAVLink specifics (1e7 degrees, type masks, MAV_CMD ids)
+// is the gateway's job, not the caller's.
+
+message Arm {}
+message Disarm {}
+message ReturnToLaunch {}
+message Land {}
+
+message SetMode {
+  string mode_name = 1;                 // "GUIDED", "LOITER", "RTL"
+}
+
+message Takeoff {
+  float target_altitude_m = 1;          // above home, not above sea level
+}
+
+message GotoPosition {
+  double target_latitude_deg = 1;              // plain degrees
+  double target_longitude_deg = 2;
+  float target_altitude_m = 3;          // above home
+}
+
+message VehicleCommand {
+  string operation_id = 1;              // client-generated, STABLE across retries
+  string vehicle_id = 2;                // "copter_1"
+  uint64 issued_at_unix_ms = 3;         // lets the gateway reject stale commands
+  uint64 expected_state_version = 4;    // 0 = don't care, else optimistic check
+
+  oneof action {
+    Arm arm = 10;
+    Disarm disarm = 11;
+    SetMode set_mode = 12;
+    Takeoff takeoff = 13;
+    GotoPosition goto_position = 14;
+    ReturnToLaunch return_to_launch = 15;
+    Land land = 16;
+  }
+}
+
+// --- Acknowledgements ------------------------------------------------------
+
+enum CommandStatus {
+  COMMAND_STATUS_UNSPECIFIED = 0;
+  ACCEPTED = 1;                // vehicle took it
+  REJECTED_RETRYABLE = 2;      // EKF not ready yet — ask again shortly
+  REJECTED_PERMANENT = 3;      // outside geofence — retrying won't help
+  ALREADY_APPLIED = 4;         // duplicate operation_id, applied earlier
+  STALE_STATE_VERSION = 5;     // world moved on since this was approved
+}
+
+message CommandAck {
+  string operation_id = 1;
+  string vehicle_id = 2;
+  CommandStatus status = 3;
+  string reason = 4;                    // readable by a human and by the model
+  uint64 state_version = 5;             // vehicle version AFTER this command
+  uint64 acked_at_unix_ms = 6;
+}
+
+// --- Telemetry, broadcast continuously -------------------------------------
+
+message VehicleTelemetry {
+  string vehicle_id = 1;
+  uint64 sampled_at_unix_ms = 2;
+  double latitude_deg = 3;
+  double longitude_deg = 4;
+  float altitude_m = 5;                 // above home
+  float ground_speed_mps = 6;
+  float heading_deg = 7;
+  string flight_mode = 8;
+  bool is_armed = 9;
+  uint32 gps_fix_type = 10;             // 3 or more is usable
+  float battery_percent = 11;
+  uint64 state_version = 12;            // increments on every accepted command
+}
+// --- Client to gateway envelope --------------------------------------------
+// Every datagram on the command port is a ClientRequest and every datagram the
+// gateway sends back on that socket is a GatewayResponse. Protobuf has no
+// self-describing wire format, so without an envelope a receiver cannot tell a
+// command from a status query. Telemetry needs no envelope: it has its own
+// port and only ever carries VehicleTelemetry.
+
+message CommandStatusQuery {
+  string operation_id = 1;              // "what happened to this command?"
+}
+
+message CommandStatusResponse {
+  string operation_id = 1;
+  bool is_known = 2;                    // false = gateway never saw this op
+  CommandAck ack = 3;                   // set only when is_known is true
+}
+
+message ClientRequest {
+  oneof request {
+    VehicleCommand command = 1;
+    CommandStatusQuery status_query = 2;
+  }
+}
+
+message GatewayResponse {
+  oneof response {
+    CommandAck ack = 1;
+    CommandStatusResponse status = 2;
+  }
+}

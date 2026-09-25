@@ -1,0 +1,26 @@
+[project]
+name = "weekend-harness"
+version = "0.1.0"
+description = "Experimental MCP and ArduPilot harness"
+requires-python = ">=3.11"
+dependencies = [
+"pymavlink",
+"mcp==2.2.0",
+"anthropic",
+"ollama",
+"protobuf",
+"grpcio-tools",
+"mcp[cli]==2.2.0",
+]
+
+[dependency-groups]
+dev = [
+"pytest",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

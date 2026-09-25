@@ -1,0 +1,36 @@
+# --- environments ---------------------------------------------------------
+.venv/
+*/.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# --- generated at run time ------------------------------------------------
+# The harness's durable ledger. Real mission state, not source.
+mission_store.sqlite3
+mission_store.sqlite3-*
+
+# Run traces. Useful evidence but they pile up fast; force-add an exemplar
+# with `git add -f traces/<one>.jsonl` if you want one in the README.
+traces/
+
+# --- vendored simulator ---------------------------------------------------
+# A separate clone with its own .git. Keep it out of this repo and credit it
+# in the README instead (see ardupilot_sitl_docker/README.md for its origin).
+ardupilot_sitl_docker/
+
+
+
+# --- editor / OS noise ----------------------------------------------------
+.vscode/
+*:Zone.Identifier
+.DS_Store
+
+# --- observability captures ------------------------------------------------
+# Telemetry captures and built logs are generated and large. Force-added one
+# exemplar with `git add -f` for the README to reference.
+captures/
+observability/*.mcap
+eval/gateway.log
+
+notes/
