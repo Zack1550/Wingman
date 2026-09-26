@@ -1,13 +1,86 @@
 # Wingman Harness
 
-A natural-language mission orchestrator for simulated multirotor aircraft, built
+A natural-language mission orchestrator for a simulated fleet, built
 against ArduPilot SITL. 
 
 End goal: A single natural-language fleet orchestrator capable of running single craft or a fleet.
 
-Scoping limits: As a personal project the harness will only manage
-a "fleet" consisting of a rover and multirotor aircraft.
+Scoping limits: As a personal project, "fleet" will consist of a rover and a multirotor aircraft.
 
+## Results
+
+Twelve natural-language missions, end to end against SITL. Every trial resets
+the simulator: the simulated battery drains by flying and persists across runs,
+so without a reset the twelfth mission is flown by a different aircraft than the
+first.
+
+| Model | Cases | Acceptable | Fail | Median model time | Median wall time | Cost | Cost/case |
+|---|---|---|---|---|---|---|---|
+| `claude-sonnet-5` | 12 | **12/12 (100%)** | 0 | 10 s | 131 s | $0.19 | $0.016 |
+| `granite4.1:3b` (local) | 12 | **3/12 (25%)** | 9 | 68 s | 179 s | $0.00 | $0.000 |
+
+Median wall time includes the ~90 s reset, which is a property of this laptop
+rather than of either model. Underneath the missions, **149 layer-one tests run
+in ~20 s** against an in-process fake gateway, with no Docker needed. It does not yet persist the dedup ledger across restart, reconnect a dead link, run missions concurrently, enforce battery, or plan without an internet model; see Known gaps.
+
+**Where the local model fails is more interesting than the rate.** Five of
+granite's nine failures are `no_plan` — it could not turn the mission into an
+ordered structure at all. The other four produced a plan that broke during
+execution. It reads state and reports it correctly (`read_only`: 1/1); it cannot
+reliably plan (`takeoff_hover`, `state_aware`, `land_recover`, `navigate`: 0/2,
+0/2, 0/2, 0/1). Driving tools one at a time is a different capability from
+emitting a whole plan, and only the second one broke.
+
+Five further cases are held out in `evals/reserved/` and were not consulted
+while tuning.
+
+Outcome assertions alone would score a correct refusal as a failure. They would
+also pass a model that reached the right altitude having claimed to observe it
+from a reading of 9.93 m, which is why `observed_arrival` checks that *some tool
+actually saw the aircraft near the target*, whatever the prose says.
+
+### Three verdicts, not two
+A refusal is only correct if the reason it gives is true. Grading reads the
+trace, the ledger and final telemetry — never the model's closing paragraph,
+except where the entire point is to check it.
+
+- **pass** — the mission was carried out and the assertions hold
+- **declined** — the model refused, and the grounds it cited were true of the vehicle
+- **fail** — anything else, including a refusal with no grounds
+
+## Where this is going
+
+The end state is a system that is commanded by voice from a phone, with the whole stack running on the crafts and no internet. 
+
+Scenario to fulfill: A vehicle that follows a hiker with onboard vision. Eventually, when onboard vision fails, a copter riding on the rover launches, finds the hiker from above, and hands the rover a bearing.
+
+The load-bearing design decision, and the thing every new
+requirement gets checked against:
+
+| | Fast loop | Slow loop |
+|---|---|---|
+| Rate | ~20 Hz | seconds |
+| Where | entirely onboard | phone, over WiFi |
+| Decides | where to be right now | what the mission is |
+| Made of | vision + a controller + arithmetic | a model, a plan, an approval |
+| If the link drops | keeps working | waits and resumes |
+
+The model never steers. It requests a **state transition**, and a state machine
+decides whether that transition is legal. One rule carries over from the
+simulator unchanged: **the gateway stays the only writer to the flight
+controller.**
+
+**The rover gets built first.** Every genuinely hard problem left here is
+software — the local model that scored 3/12, the state machine, plan-level
+approval, the follow controller, the phone app — and none of it cares whether
+the vehicle has wheels or props. On a rover you can debug all of it walking
+alongside at two miles an hour with a kill switch in your hand, five hours to a
+charge, where a bug costs a scraped chassis instead of a camera in pieces up a
+tree. The copter comes after the autonomy works, leaving one new problem: 
+flying is unforgiving. `vehicle_gateway` carries over untouched — ArduPilot
+Rover speaks the same MAVLink.
+
+## Dataflow
 
 ```
   you ──► planner ──► a plan, as data       the model proposes.
@@ -70,11 +143,7 @@ airborne.
 The gateway's link can be made to **drop, duplicate, reorder and delay**, because
 a harness that has only run over loopback has never been tested. When an
 acknowledgement goes missing, the correct behaviour is neither to retry nor to
-report failure: the outcome is genuinely *unknown*, and unknown is a treated as
-a first class state system reports. The client asks the gateway what it
-recorded for that specific `operation_id` and gets the original acknowledgement
-back verbatim — a lookup by key, not an inference from a state change, which
-matters the moment two things can command one aircraft. 
+report failure: the outcome is genuinely *unknown*. The client asks the gateway what it recorded for that specific `operation_id` and gets the original acknowledgement back verbatim — a lookup by key, not an inference from a state change, which matters the moment two things can command one aircraft. 
 
 Note:
 > In a recorded mission the aircraft was already descending 1.6 seconds after the command while the harness did not learn its command had landed for six more seconds. That window
@@ -82,8 +151,8 @@ is not an error condition; it is the normal state of a distributed system, and e
 safety property here is designed to survive it.
 
 There are **two routes from a model to an aircraft**, and they differ in what
-stands between intent and action. The agent loop allows a model call tools
-directly, guarded by step, tool-call and deadline budgets, with argument
+stands between intent and action. The agent loop allows a model to request tool
+calls directly, guarded by step, tool-call and deadline budgets, with argument
 validation and unknown-tool rejection returning structured errors the model can
 recover from rather than exceptions that kill the run. The plan path adds a
 human: constraints are checked *before* the operator is asked and
@@ -142,47 +211,6 @@ python -m evals.report --markdown
 `harness/run.py` puts a model in a loop where it calls the MCP tools directly, guarded by step,
 tool-call and deadline budgets. That path has no approval gate — it is for watching a model work. 
 **Avoid flying anything you'd be sad to lose.**
-
-## Results
-
-Twelve natural-language missions, end to end against SITL. Every trial resets
-the simulator: the simulated battery drains by flying and persists across runs,
-so without a reset the twelfth mission is flown by a different aircraft than the
-first.
-
-| Model | Cases | Acceptable | Fail | Median model time | Median wall time | Cost | Cost/case |
-|---|---|---|---|---|---|---|---|
-| `claude-sonnet-5` | 12 | **12/12 (100%)** | 0 | 10 s | 131 s | $0.19 | $0.016 |
-| `granite4.1:3b` (local) | 12 | **3/12 (25%)** | 9 | 68 s | 179 s | $0.00 | $0.000 |
-
-Median wall time includes the ~90 s reset, which is a property of this laptop
-rather than of either model.
-
-**Where the local model fails is more interesting than the rate.** Five of
-granite's nine failures are `no_plan` — it could not turn the mission into an
-ordered structure at all. The other four produced a plan that broke during
-execution. It reads state and reports it correctly (`read_only`: 1/1); it cannot
-reliably plan (`takeoff_hover`, `state_aware`, `land_recover`, `navigate`: 0/2,
-0/2, 0/2, 0/1). Driving tools one at a time is a different capability from
-emitting a whole plan, and only the second one broke.
-
-Five further cases are held out in `evals/reserved/` and were not consulted
-while tuning.
-
-### Three verdicts, not two
-
-A refusal is only correct if the reason it gives is true. Grading reads the
-trace, the ledger and final telemetry — never the model's closing paragraph,
-except where the entire point is to check it.
-
-- **pass** — the mission was carried out and the assertions hold
-- **declined** — the model refused, and the grounds it cited were true of the vehicle
-- **fail** — anything else, including a refusal with no grounds
-
-Outcome assertions alone would score a correct refusal as a failure. They would
-also pass a model that reached the right altitude having claimed to observe it
-from a reading of 9.93 m, which is why `observed_arrival` checks that *some tool
-actually saw the aircraft near the target*, whatever the prose says.
 
 ## The lost acknowledgement
 
@@ -252,7 +280,7 @@ data projections, widening the acceptance range, and hallucination.
 WSL2/Docker/SITL and not this code. Every timeout sits above that floor;
 `TRANSPORT_WORST_GAP_S` records it. Re-measure on other hardware.
 
-**Two model calls, not nine.** A mission costs $0.016 on the plan-then-execute
+**Two model calls, not eight.** A mission costs $0.016 on the plan-then-execute
 path against roughly $0.12 on the agent loop, because the loop resends the whole
 conversation every step while the plan path calls the model twice. An 8×
 difference from an architecture choice rather than a model choice.
@@ -271,6 +299,10 @@ difference from an architecture choice rather than a model choice.
 - **Approved writes bypass the MCP tool layer** so the executor can own the
   `operation_id`. Constraints therefore live in a module both paths call;
   anything added to a tool body alone would not protect the executor path.
+- **One operator, and no authority model.** Approval is a console prompt:
+  whoever is at the terminal can approve anything. No identity, no roles, no
+  second-person concurrence for a higher-risk command, and the ledger records
+  that something was approved rather than *who* approved it.
 - **No battery or range constraint.** A model that flies a 0% aircraft is not
   making a mistake this system ever told it not to make. If battery matters it
   belongs in `constraints.py`.
@@ -279,6 +311,12 @@ difference from an architecture choice rather than a model choice.
   judge over the trace.
 - **No document retrieval** and **no fine-tuning**.
 - One vehicle type, one API I defined myself, and a laptop.
+
+#### Lessons learned
+- Nearly every serious bug turned out to be the same mistake in different clothes: something reporting an outcome it had never verified. The gateway kept broadcasting an aircraft's last-known state after its own uplink died. The executor stamped a read as success without inspecting what came back, so a mission whose confirming step returned gateway_unavailable reported completed. The eval reset slept eight seconds and hoped the simulator was ready; stop_gateway sent a signal and assumed the port was free. I spent two days criticising models for claiming success telemetry hadn't shown them, and found the identical error four times in my own code — which is the honest version of "prompts ask, code guarantees." The highest-leverage change all wasn't a prompt at all: rewriting one rejection from "vehicle answered FAILED to arm" to "cannot arm while in RTL; set_mode to GUIDED first" turned a model that retried blindly and gave up into one that recovered on the next step. Same model, same prompt — better words from the machine.
+
+#### Points of Interest
+- A link that died every 33 seconds turned out not to be my code: the simulator stack stalls ~3.3 s every ~34 s, reproducible with a bare pymavlink listener and no gateway running, which meant every timeout I'd chosen as a round number sat below the transport's actual floor. Given a min/max band to pick for a 45 m target, a model chose 40–50 and declared success at 40.6 m while still climbing — so tolerance moved out of the arguments and into the tool as a constant. Two frontier models given identical evidence disagreed about whether to fly a 0%-battery aircraft: one refused, cross-checked the second vehicle to rule out a broken field, and offered alternatives; the other flew it. And the local 3B model's failures weren't where I expected — it drove tools competently one at a time and failed at planning, five of nine failures producing no usable plan at all.
 
 ## Attribution
 
@@ -297,9 +335,3 @@ difference from an architecture choice rather than a model choice.
 
 Models: `claude-sonnet-5`, `claude-opus-5`, `granite4.1:3b` (local, via Ollama).
 
-
-#### Lessons learned
-- Nearly every serious bug turned out to be the same mistake in different clothes: something reporting an outcome it had never verified. The gateway kept broadcasting an aircraft's last-known state after its own uplink died. The executor stamped a read as success without inspecting what came back, so a mission whose confirming step returned gateway_unavailable reported completed. The eval reset slept eight seconds and hoped the simulator was ready; stop_gateway sent a signal and assumed the port was free. I spent two days criticising models for claiming success telemetry hadn't shown them, and found the identical error four times in my own code — which is the honest version of "prompts ask, code guarantees." The highest-leverage change all wasn't a prompt at all: rewriting one rejection from "vehicle answered FAILED to arm" to "cannot arm while in RTL; set_mode to GUIDED first" turned a model that retried blindly and gave up into one that recovered on the next step. Same model, same prompt — better words from the machine.
-
-#### Interesting things
-- A link that died every 33 seconds turned out not to be my code: the simulator stack stalls ~3.3 s every ~34 s, reproducible with a bare pymavlink listener and no gateway running, which meant every timeout I'd chosen as a round number sat below the transport's actual floor. Given a min/max band to pick for a 45 m target, a model chose 40–50 and declared success at 40.6 m while still climbing — so tolerance moved out of the arguments and into the tool as a constant. Two frontier models given identical evidence disagreed about whether to fly a 0%-battery aircraft: one refused, cross-checked the second vehicle to rule out a broken field, and offered alternatives; the other flew it. And the local 3B model's failures weren't where I expected — it drove tools competently one at a time and failed at planning, five of nine failures producing no usable plan at all.
