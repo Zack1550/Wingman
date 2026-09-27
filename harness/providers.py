@@ -15,6 +15,7 @@ The neutral vocabulary:
                       {"role": "tool",      "tool_call_id": str, "name": str, "content": str}
     reply             ModelReply(text, tool_calls, usage)
 """
+
 import json
 import os
 import uuid
@@ -23,6 +24,13 @@ from dataclasses import dataclass, field
 
 DEFAULT_ANTHROPIC_MODEL = "claude-opus-5"
 DEFAULT_OLLAMA_MODEL = "granite4.1:3b"
+# Ollama truncates silently when a conversation outgrows its context window: no
+# error, the oldest tokens are dropped, and the system prompt goes first. The
+# default window differs between Ollama versions and machines, so it is set
+# here rather than inherited. The planner prompt is about 1.2k tokens and fits
+# any default; turns that carry tool results grow, and are what this protects.
+# Raising it costs memory, not correctness.
+DEFAULT_OLLAMA_NUM_CTX = 16384
 # Not a cost knob: max_tokens is a ceiling, and only tokens actually produced
 # are billed. Too low truncates a turn mid-thought, and on a model that thinks
 # adaptively the reasoning counts against it too.
@@ -169,10 +177,14 @@ class OllamaProvider(Provider):
 
     name = "ollama"
 
-    def __init__(self, model=DEFAULT_OLLAMA_MODEL, host=None, options=None):
+    def __init__(self, model=DEFAULT_OLLAMA_MODEL, host=None, options=None,
+                 num_ctx=DEFAULT_OLLAMA_NUM_CTX):
         import ollama
         self.model = model
-        self.options = options or {"temperature": 0.0}
+        self.num_ctx = num_ctx
+        # Merged, not replaced: a caller passing {"temperature": 0.2} should not
+        # silently lose the context window along with the default it overrode.
+        self.options = {"temperature": 0.0, "num_ctx": num_ctx, **(options or {})}
         self._client = ollama.Client(host=host) if host else ollama
 
     def complete(self, system, messages, tools):

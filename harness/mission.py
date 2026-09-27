@@ -22,6 +22,7 @@ from harness.approval import AutoApprovalGate, ConsoleApprovalGate
 from harness.executor import Executor, reconcile_outstanding
 from harness.planner import describe_situation, make_plan
 from harness.providers import build_provider
+from harness.replan import MAX_PLAN_ATTEMPTS, plan_and_run
 from harness.store import MissionStore
 from harness.toolbox import ToolBox
 from harness.trace import Trace
@@ -59,7 +60,8 @@ def main():
         client.await_first_sample(timeout_s=3.0)
 
         with Trace(task=args.task, provider=provider.describe()) as trace:
-            trace.write("mission_started", run_id=run_id, task=args.task)
+            trace.write("mission_started", source="harness", run_id=run_id,
+                        task=args.task)
 
             # Before anything new, settle anything old. A command left
             # outstanding by a previous process may already have flown.
@@ -69,28 +71,19 @@ def main():
                 for op_id, outcome in recovered:
                     print(f"  {op_id} -> {outcome}", file=sys.stderr)
 
-            situation = describe_situation(client)
             print(f"model: {provider.describe()}\n", file=sys.stderr)
-            print(f"the aircraft right now:\n{situation}\n", file=sys.stderr)
-            print("planning …\n", file=sys.stderr)
-            trace.write("situation", situation=situation)
-            plan = make_plan(args.task, provider, toolbox, trace,
-                             situation=situation)
 
-            if not plan.is_valid:
-                # A planner that declines has usually said why, and its reason
-                # is more useful than our schema complaint. Show both.
-                if plan.summary:
-                    print(f"the planner declined:\n  {plan.summary}\n")
-                print("no usable plan:")
-                for problem in plan.problems:
-                    print(f"  - {problem}")
-                return 2
-
-            print(plan.describe())
-            print()
             if args.plan_only:
-                print("(--plan-only: nothing was approved and nothing flew)")
+                situation = describe_situation(client)
+                print(f"the aircraft right now:\n{situation}\n",
+                      file=sys.stderr)
+                trace.write("situation", source="gateway", situation=situation)
+                plan = make_plan(args.task, provider, toolbox, trace,
+                                 situation=situation)
+                if not plan.is_valid:
+                    return _no_usable_plan(plan)
+                print(plan.describe())
+                print("\n(--plan-only: nothing was approved and nothing flew)")
                 return 0
 
             if args.approve_all:
@@ -102,11 +95,27 @@ def main():
             else:
                 gate = ConsoleApprovalGate()
 
+            def show(plan, number):
+                # The operator sees every plan before approving any of it, and
+                # a replan says it is one: approvals from the last plan cover
+                # nothing here.
+                if number > 1:
+                    print(f"\nthe vehicle stopped the last plan; replanning "
+                          f"({number} of {MAX_PLAN_ATTEMPTS})\n")
+                print(plan.describe())
+                print()
+
+            print("planning …\n", file=sys.stderr)
             executor = Executor(store, gate, client=client, toolbox=toolbox,
                                 trace=trace, approval_ttl_s=args.approval_ttl)
-            result = executor.run(plan, run_id)
-            trace.write("mission_finished", run_id=run_id,
-                        stop_reason=result.stop_reason)
+            result = plan_and_run(args.task, provider, toolbox, executor,
+                                  run_id, trace=trace, on_plan=show)
+            if result.stop_reason == "no_plan":
+                return _no_usable_plan(result.first_plan)
+            trace.write("mission_finished", source="harness", run_id=run_id,
+                        stop_reason=result.stop_reason,
+                        plan_attempts=result.plan_attempts,
+                        succeeded_on_plan=result.succeeded_on)
 
         print(result.describe())
         print(f"\nrun_id : {run_id}")
@@ -121,6 +130,17 @@ def main():
 
         client.close()
     return 0 if result.completed else 1
+
+
+def _no_usable_plan(plan):
+    # A planner that declines has usually said why, and its reason is more
+    # useful than our schema complaint. Show both.
+    if plan.summary:
+        print(f"the planner declined:\n  {plan.summary}\n")
+    print("no usable plan:")
+    for problem in plan.problems:
+        print(f"  - {problem}")
+    return 2
 
 
 if __name__ == "__main__":

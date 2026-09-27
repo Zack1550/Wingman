@@ -31,6 +31,7 @@ ardupilot_sitl_docker/
 # exemplar with `git add -f` for the README to reference.
 captures/
 observability/*.mcap
-eval/gateway.log
+evals/gateway.log
+evals/results/*
 
 notes/

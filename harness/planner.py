@@ -100,6 +100,10 @@ class Plan:
     steps: list = field(default_factory=list)
     raw: dict = field(default_factory=dict)
     problems: list = field(default_factory=list)
+    # The model submitted a plan the harness cannot run: steps with no tool, an
+    # unknown tool, bad arguments. Distinct from an empty plan, which is how a
+    # model declines, and from no submission at all.
+    malformed: bool = False
 
     @property
     def is_valid(self):
@@ -171,7 +175,8 @@ def validate_plan(raw, toolbox):
     steps = []
 
     if not isinstance(raw, dict):
-        return Plan(problems=[f"plan must be an object, got {type(raw).__name__}"])
+        return Plan(problems=[f"plan must be an object, got {type(raw).__name__}"],
+                    malformed=True)
 
     for index, entry in enumerate(raw.get("steps") or [], 1):
         if not isinstance(entry, dict):
@@ -196,11 +201,12 @@ def validate_plan(raw, toolbox):
                               rationale=str(entry.get("rationale", "")),
                               risk=str(entry.get("risk", "low")).lower()))
 
+    malformed = bool(problems)
     if not steps and not problems:
         problems.append("the plan has no steps")
 
     return Plan(summary=str(raw.get("summary", "")), steps=steps, raw=raw,
-                problems=problems)
+                problems=problems, malformed=malformed)
 
 
 def describe_situation(client, vehicles=None):
@@ -240,8 +246,47 @@ def describe_situation(client, vehicles=None):
     return "\n".join(lines) or "- no vehicle is broadcasting telemetry"
 
 
-def make_plan(task, provider, toolbox, trace=None, attempts=2, situation=None):
-    """One model turn, validated. A malformed plan gets one chance to be fixed."""
+def describe_history(history, plan_attempt, max_plan_attempts):
+    """What earlier plans did, for a replan, in the vehicle's own words.
+
+    A replan is only better than the plan before it if the model sees why that
+    one stopped. The gateway's rejections say what to do instead ("arm first,
+    then take off", "use a goto at the current position"), and until this
+    existed those words reached the closing report and nothing else.
+    """
+    lines = [f"This is plan {plan_attempt} of {max_plan_attempts}. "
+             f"Earlier plans for this task did not finish:"]
+    for earlier in history:
+        result = earlier.result
+        lines.append(f"\nPlan {earlier.number} stopped: {result.stop_reason}.")
+        ran = {outcome.index for outcome in result.outcomes}
+        for outcome in result.outcomes:
+            reason = f": {outcome.reason}" if outcome.reason else ""
+            lines.append(f"  {outcome.index}. {outcome.tool}"
+                         f"({_short_args(outcome.args)}) -> "
+                         f"{outcome.status}{reason}")
+        for index, step in enumerate(earlier.plan.steps, 1):
+            if index not in ran:
+                lines.append(f"  {index}. {step.tool}"
+                             f"({_short_args(step.args)}) -> not run")
+    lines.append(
+        "\nThe aircraft's current state, in the system prompt, already "
+        "reflects everything above. Plan what is still needed to finish the "
+        "original task from that state, taking the reasons above into "
+        "account. Commands that were applied have taken effect; do not repeat "
+        "them unless the current state shows they need repeating. Every "
+        "command in the new plan is approved again before it runs.")
+    return "\n".join(lines)
+
+
+def make_plan(task, provider, toolbox, trace=None, attempts=2, situation=None,
+              history=None, plan_attempt=1, max_plan_attempts=1):
+    """One model turn, validated. A malformed plan gets one chance to be fixed.
+
+    `attempts` is that fix-up for a plan that fails validation. `plan_attempt`
+    is a different count: which plan for this task this is, when earlier ones
+    were rejected by the vehicle and `history` says how.
+    """
     system = f"{PLANNER_SYSTEM}\n\nTools you may plan with:\n{tool_catalogue(toolbox)}"
     if situation:
         system += (f"\n\nThe aircraft RIGHT NOW:\n{situation}\n"
@@ -252,7 +297,11 @@ def make_plan(task, provider, toolbox, trace=None, attempts=2, situation=None):
                    f"the positions above when a step needs coordinates — you "
                    f"cannot refer to the output of an earlier step, because "
                    f"the operator approves each command exactly as written.")
-    messages = [{"role": "user", "content": task}]
+    content = task
+    if history:
+        content += "\n\n" + describe_history(history, plan_attempt,
+                                              max_plan_attempts)
+    messages = [{"role": "user", "content": content}]
     plan = Plan(problems=["the planner produced nothing"])
 
     for attempt in range(1, attempts + 1):
@@ -267,7 +316,8 @@ def make_plan(task, provider, toolbox, trace=None, attempts=2, situation=None):
             plan = validate_plan(call.arguments, toolbox)
 
         if trace is not None:
-            trace.write("plan_proposed", attempt=attempt,
+            trace.write("plan_proposed", source="model",
+                        plan_attempt=plan_attempt, attempt=attempt,
                         model_latency_ms=model_latency_ms,
                         summary=plan.summary,
                         steps=[{"tool": s.tool, "args": s.args, "risk": s.risk}

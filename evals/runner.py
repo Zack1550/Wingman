@@ -5,7 +5,7 @@
     python -m evals.runner --case hover_at_15 --provider ollama
     python -m evals.runner --reserved --provider anthropic   # the held-out five
 
-Every trial resets the simulator. That is slow — about ninety seconds — and it
+Every trial resets the simulator. That is slow — about fifty seconds — and it
 is not optional: the simulated battery drains by flying and persists across
 runs, so without a reset the twelfth mission is flown by a different aircraft
 than the first, and the results stop meaning anything.
@@ -22,7 +22,7 @@ from evals import cases as visible_cases
 from evals.grading import DECLINED, FAIL, PASS, RunRecord, grade, load_trace
 from harness.approval import AutoApprovalGate
 from harness.executor import Executor
-from harness.planner import describe_situation, make_plan
+from harness.replan import MAX_PLAN_ATTEMPTS, plan_and_run
 from harness.providers import build_provider
 from harness.store import MissionStore
 from harness.toolbox import ToolBox
@@ -48,9 +48,11 @@ PRICING = {
 REPO = Path(__file__).resolve().parent.parent
 STACK = REPO / "ardupilot_sitl_docker" / "stacks" / "n_copters"
 COMPOSE = ["docker", "compose", "-f", "docker-compose-2.yml"]
-EKF_SETTLE_S = 62
+SIM_SYSTEM_IDS = (1, 2)   # the MAVLink sysids docker-compose-2.yml starts
+EKF_READY_TIMEOUT_S = 120
 GATEWAY_LOG = REPO / "evals" / "gateway.log"
 EXECUTOR_TELEMETRY_PORT = 14552
+_gateway = None   # the gateway this process started, so it can be stopped
 
 
 # --- the world --------------------------------------------------------------
@@ -74,26 +76,42 @@ def stop_gateway(timeout_s=15):
     assumed — so the next gateway died on bind, its log was truncated by the
     reset, and the symptom surfaced three layers away as "the link never became
     steady".
+
+    The version after that matched `python .*gateway.py`, which never matches
+    under a venv — the interpreter is `python3` — so it killed nothing and the
+    second case of every run died with udp/14550 held by the first case's
+    gateway. Stop the process we started by its handle; sweep by path only for
+    strays left by an earlier, interrupted run.
     """
     for signal_name in ("TERM", "KILL"):
-        subprocess.run(
-            f"ps -eo pid,args | grep -E 'python .*gatew.y[.]py' | grep -v grep "
-            f"| awk '{{print $1}}' | xargs -r kill -{signal_name}",
-            shell=True, capture_output=True)
+        if _gateway is not None and _gateway.poll() is None:
+            (_gateway.terminate if signal_name == "TERM" else _gateway.kill)()
+        subprocess.run(["pkill", f"-{signal_name}", "-f",
+                        r"vehicle_gateway/gateway[.]py"], capture_output=True)
         deadline = time.time() + timeout_s / 2
         while time.time() < deadline:
             if command_port_is_free():
+                _reap_gateway()
                 return True
             time.sleep(0.5)
+    _reap_gateway()
     return command_port_is_free()
 
 
+def _reap_gateway():
+    global _gateway
+    if _gateway is not None and _gateway.poll() is not None:
+        _gateway = None
+
+
 def start_gateway(gateway_flags=()):
+    global _gateway
     with open(GATEWAY_LOG, "a", encoding="utf-8") as log:
-        return subprocess.Popen(
+        _gateway = subprocess.Popen(
             [sys.executable, str(REPO / "vehicle_gateway" / "gateway.py"),
              *gateway_flags],
             cwd=REPO, stdout=log, stderr=subprocess.STDOUT)
+    return _gateway
 
 
 def router_is_serving(timeout_s=90):
@@ -122,19 +140,28 @@ def router_is_serving(timeout_s=90):
     return False
 
 
-def link_is_steady(seconds=6.0, max_gap_s=1.2, port=EXECUTOR_TELEMETRY_PORT):
+def link_is_steady(seconds=6.0, max_gap_s=1.2, first_sample_timeout_s=15.0,
+                   port=EXECUTOR_TELEMETRY_PORT):
     """Telemetry arriving without a gap, not merely arriving once.
 
     A gateway started before mavlink-router is ready gets a TCP connection that
     keeps dying, and the symptom is not silence — it is heartbeats arriving too
     late for set_mode to confirm inside its window. Checking for a steady
     stream catches that; checking for any sample at all does not.
+
+    The window starts at the first sample rather than after a fixed sleep, so
+    a gateway that connects quickly is not made to wait out a slow one's time.
     """
     import socket
     listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         listener.bind(("0.0.0.0", port))
+        listener.settimeout(first_sample_timeout_s)
+        try:
+            listener.recvfrom(65535)
+        except socket.timeout:
+            return False
         listener.settimeout(max_gap_s)
         deadline = time.time() + seconds
         while time.time() < deadline:
@@ -147,6 +174,48 @@ def link_is_steady(seconds=6.0, max_gap_s=1.2, port=EXECUTOR_TELEMETRY_PORT):
         listener.close()
 
 
+def ekf_is_ready(system_ids=SIM_SYSTEM_IDS, timeout_s=EKF_READY_TIMEOUT_S,
+                 hold_s=2.0):
+    """Wait until every aircraft's EKF has an absolute position, then go.
+
+    This replaced a fixed 62 s sleep. Arming is refused with "Need Position
+    Estimate" until the EKF reports an absolute horizontal position and has
+    left constant-position mode; on this stack that happens about 46 s after
+    boot, and the first arm is accepted within a second of it. SYS_STATUS's
+    pre-arm health bit looked like the obvious signal and is not: it stayed
+    unhealthy while arms were being accepted.
+
+    This listens on the router beside the gateway and sends nothing. It hears
+    EKF_STATUS_REPORT only because the gateway has asked for streams, so it
+    must run after the gateway is up.
+    """
+    from pymavlink import mavutil
+    mavlink = mavutil.mavlink
+    link = mavutil.mavlink_connection("tcp:127.0.0.1:5760")
+    ready_since = {}
+    deadline = time.time() + timeout_s
+    try:
+        while time.time() < deadline:
+            message = link.recv_match(type="EKF_STATUS_REPORT", blocking=True,
+                                      timeout=1)
+            if message is None or message.get_srcSystem() not in system_ids:
+                continue
+            system_id = message.get_srcSystem()
+            positioned = (message.flags & mavlink.EKF_POS_HORIZ_ABS
+                          and not message.flags & mavlink.EKF_CONST_POS_MODE)
+            if not positioned:
+                ready_since.pop(system_id, None)
+                continue
+            ready_since.setdefault(system_id, time.time())
+            if (len(ready_since) == len(system_ids) and
+                    all(time.time() - since >= hold_s
+                        for since in ready_since.values())):
+                return True
+        return False
+    finally:
+        link.close()
+
+
 def reset_world(gateway_flags=(), quiet=True, attempts=3):
     """Fresh simulator, fresh gateway, and proof the link actually works.
 
@@ -156,7 +225,9 @@ def reset_world(gateway_flags=(), quiet=True, attempts=3):
     had nothing to do with the model.
     """
     stop_gateway()
-    subprocess.run(COMPOSE + ["down"], cwd=STACK, capture_output=True)
+    # -t 0: the simulator boots with -w and wipes its own state, so a graceful
+    # shutdown preserves nothing and only waits out Docker's stop timeout.
+    subprocess.run(COMPOSE + ["down", "-t", "0"], cwd=STACK, capture_output=True)
     subprocess.run(COMPOSE + ["up", "-d"], cwd=STACK, capture_output=True)
     GATEWAY_LOG.write_text("")
 
@@ -167,7 +238,6 @@ def reset_world(gateway_flags=(), quiet=True, attempts=3):
         if not stop_gateway():
             raise RuntimeError("udp/14550 is still held by something")
         start_gateway(gateway_flags)
-        time.sleep(10)
         if link_is_steady():
             break
         if not quiet or attempt > 1:
@@ -177,9 +247,13 @@ def reset_world(gateway_flags=(), quiet=True, attempts=3):
     else:
         raise RuntimeError("gateway link never became steady")
 
+    waited = time.time()
+    if not ekf_is_ready():
+        raise RuntimeError(f"no EKF position estimate after "
+                           f"{EKF_READY_TIMEOUT_S}s")
     if not quiet:
-        print(f"    waiting {EKF_SETTLE_S}s for the EKF", file=sys.stderr)
-    time.sleep(EKF_SETTLE_S)
+        print(f"    EKF ready after {time.time() - waited:.0f}s",
+              file=sys.stderr)
 
 
 def usage_and_cost(events, model):
@@ -199,7 +273,7 @@ def usage_and_cost(events, model):
     return input_tokens, output_tokens, round(cost, 4)
 
 
-def ask_for_report(provider, case, outcomes):
+def ask_for_report(provider, case, mission):
     """Have the model account for the run, so its claims can be checked.
 
     The plan is a statement of intent and the ledger is a statement of fact;
@@ -208,10 +282,11 @@ def ask_for_report(provider, case, outcomes):
     than left to be judged on its plan.
     """
     lines = []
-    for outcome in outcomes:
+    for number, outcome in mission.outcomes:
         detail = outcome.result if isinstance(outcome.result, dict) else {}
-        lines.append(f"{outcome.index}. {outcome.tool}({outcome.args}) -> "
-                     f"{outcome.status}: {outcome.reason or ''} {detail}")
+        lines.append(f"plan {number}, step {outcome.index}. {outcome.tool}"
+                     f"({outcome.args}) -> {outcome.status}: "
+                     f"{outcome.reason or ''} {detail}")
     transcript = "\n".join(lines) or "(no steps ran)"
     started = time.time()
     try:
@@ -261,29 +336,25 @@ def run_case(case, provider_name, model, store_dir, keep_world=False):
             run_preflight(client, case.get("setup", {}).get("preflight"))
 
             with Trace(task=case["task"], provider=provider.describe()) as trace:
-                trace.write("eval_case", name=case["name"],
+                trace.write("eval_case", source="harness", name=case["name"],
                             family=case["family"])
-                situation = describe_situation(client)
-                trace.write("situation", situation=situation)
-                plan = make_plan(case["task"], provider, toolbox, trace,
-                                 situation=situation)
-
-                outcomes = []
-                stop_reason = "no_plan"
+                executor = Executor(store, AutoApprovalGate(grant=True),
+                                    client=client, toolbox=toolbox,
+                                    trace=trace)
+                mission = plan_and_run(case["task"], provider, toolbox,
+                                       executor, run_id, trace=trace)
+                stop_reason = mission.stop_reason
                 report = ""
-                if plan.is_valid:
-                    executor = Executor(store, AutoApprovalGate(grant=True),
-                                        client=client, toolbox=toolbox,
-                                        trace=trace)
-                    result = executor.run(plan, run_id)
-                    outcomes = result.outcomes
-                    stop_reason = result.stop_reason
+                if stop_reason != "no_plan":
                     report, report_usage, report_ms = ask_for_report(
-                        provider, case, outcomes)
-                    trace.write("mission_report", report=report,
+                        provider, case, mission)
+                    trace.write("mission_report", source="model", report=report,
                                 usage=report_usage,
                                 model_latency_ms=report_ms)
-                trace.write("eval_finished", stop_reason=stop_reason)
+                trace.write("eval_finished", source="harness",
+                            stop_reason=stop_reason,
+                            plan_attempts=mission.plan_attempts,
+                            succeeded_on_plan=mission.succeeded_on)
 
             time.sleep(1.5)          # let telemetry catch up with the last write
             try:
@@ -293,7 +364,7 @@ def run_case(case, provider_name, model, store_dir, keep_world=False):
 
             record = RunRecord(
                 events=load_trace(trace.path),
-                final_text=report or " ".join(plan.problems),
+                final_text=report or " ".join(mission.last_plan.problems),
                 stop_reason=stop_reason,
                 final_telemetry=final,
                 ledger=store.commands_for_run(run_id),
@@ -308,6 +379,17 @@ def run_case(case, provider_name, model, store_dir, keep_world=False):
         "case": case["name"], "family": case["family"],
         "provider": provider.describe(), "verdict": verdict,
         "stop_reason": stop_reason,
+        # Which plan finished the mission (1 = the original, None = none did),
+        # and what each plan did. A pass on plan 3 and a pass on plan 1 are
+        # the same verdict and a different model.
+        "plan_attempts": mission.plan_attempts,
+        "succeeded_on_plan": mission.succeeded_on,
+        "attempts": [{"plan": a.number,
+                      "stop_reason": (a.result.stop_reason if a.result
+                                      else "invalid_plan"),
+                      "steps": [s.tool for s in a.plan.steps],
+                      "problems": a.plan.problems}
+                     for a in mission.attempts],
         # Wall clock for the whole trial including the simulator reset, and
         # again without it: the reset is a property of this laptop, the rest is
         # a property of the model.
@@ -325,6 +407,11 @@ def run_case(case, provider_name, model, store_dir, keep_world=False):
                     "args": r.args, "reason": r.reason}
                    for r in record.ledger],
         "final_text": record.final_text,
+        # Only the first plan decides whether the model can plan at all; a
+        # malformed replan after a valid plan says something narrower.
+        "plan_malformed": (stop_reason == "no_plan"
+                           and mission.first_plan.malformed),
+        "plan_problems": mission.first_plan.problems,
         "checks": [{"name": c.name, "ok": c.ok, "detail": c.detail}
                    for c in checks],
     }
@@ -380,13 +467,28 @@ def main():
                                                "detail": repr(error)}]}
         results.append(result)
         mark = {PASS: "PASS", DECLINED: "DECLINED", FAIL: "FAIL"}[result["verdict"]]
-        print(f"    {mark}  ({result['stop_reason']})  "
+        plans = (f", plan {result['succeeded_on_plan']}/{MAX_PLAN_ATTEMPTS}"
+                 if result.get("succeeded_on_plan")
+                 else f", {result['plan_attempts']} plan(s)"
+                 if result.get("plan_attempts", 0) > 1 else "")
+        print(f"    {mark}  ({result['stop_reason']}{plans})  "
               f"{result.get('duration_s', 0):.0f}s  "
               f"${result.get('cost_usd', 0):.3f}", file=sys.stderr)
         for check in result["checks"]:
             if not check["ok"]:
                 print(f"      x {check['name']}: {check['detail']}",
                       file=sys.stderr)
+        # A malformed plan after the retry is not a verdict on this case, it is
+        # a verdict on the model: it cannot produce plans this harness can run,
+        # and every later case would spend a simulator reset to learn that
+        # again.
+        if result.get("plan_malformed"):
+            skipped = len(selected) - index
+            print(f"\n{result['provider']} cannot produce a usable plan: on "
+                  f"{case['name']} it submitted one the harness rejected "
+                  f"({'; '.join(result['plan_problems'])}). Stopping; "
+                  f"{skipped} case(s) not run.", file=sys.stderr)
+            break
 
     label = f"{args.provider}-{args.model or 'default'}"
     if args.reserved:
@@ -408,8 +510,20 @@ def summarise(results):
     lines = [f"{good}/{total} acceptable "
              f"({counts[PASS]} pass, {counts[DECLINED]} correctly declined, "
              f"{counts[FAIL]} fail)"]
+    finished = [r["succeeded_on_plan"] for r in results
+                if r.get("succeeded_on_plan")]
+    if finished:
+        lines.append("finished on " + ", ".join(
+            f"plan {n}: {finished.count(n)}"
+            for n in range(1, MAX_PLAN_ATTEMPTS + 1)))
     for result in results:
-        lines.append(f"  {result['verdict']:9s} {result['case']}")
+        attempt = result.get("succeeded_on_plan")
+        note = (f"(plan {attempt})" if attempt
+                else f"({result.get('plan_attempts')} plans, "
+                     f"{result['stop_reason']})"
+                if result.get("plan_attempts", 0) > 1 else "")
+        lines.append(f"  {result['verdict']:9s} {result['case']:28s} {note}"
+                     .rstrip())
     return "\n".join(lines)
 
 

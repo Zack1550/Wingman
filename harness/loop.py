@@ -80,8 +80,8 @@ def run(task, provider, toolbox, budget=None, trace=None, system=SYSTEM_PROMPT):
     tool_calls = 0
 
     def finish(stop_reason, final_text=""):
-        trace.write("stopped", stop_reason=stop_reason, steps=steps,
-                    tool_calls=tool_calls)
+        trace.write("stopped", source="harness", stop_reason=stop_reason,
+                    steps=steps, tool_calls=tool_calls)
         return Result(stop_reason=stop_reason, final_text=final_text,
                       steps=steps, tool_calls=tool_calls, messages=messages,
                       run_id=getattr(trace, "run_id", ""),
@@ -101,7 +101,7 @@ def run(task, provider, toolbox, budget=None, trace=None, system=SYSTEM_PROMPT):
         reply = provider.complete(system, messages, definitions)
         latency_ms = int((time.time() - model_started) * 1000)
 
-        trace.write("model_reply", step=steps, latency_ms=latency_ms,
+        trace.write("model_reply", source="model", step=steps, latency_ms=latency_ms,
                     model_latency_ms=latency_ms,
                     text=reply.text, thinking=reply.thinking,
                     tool_calls=[{"name": call.name, "arguments": call.arguments}
@@ -124,7 +124,8 @@ def run(task, provider, toolbox, budget=None, trace=None, system=SYSTEM_PROMPT):
                               f"{budget.max_tool_calls} tool calls",
                     "advice": "Stop and report what you have confirmed so far.",
                 }))
-                trace.write("tool_refused", step=steps, tool=call.name,
+                trace.write("tool_refused", source="harness", step=steps,
+                            tool=call.name,
                             reason="tool_call_budget_exhausted")
                 continue
 
@@ -138,8 +139,8 @@ def run(task, provider, toolbox, budget=None, trace=None, system=SYSTEM_PROMPT):
 def _dispatch(toolbox, call, trace, step):
     """Look it up, check it, run it. Every failure returns, none raises."""
     if call.name not in toolbox:
-        trace.write("tool_refused", step=step, tool=call.name,
-                    reason="unknown_tool")
+        trace.write("tool_refused", source="harness", step=step,
+                    tool=call.name, reason="unknown_tool")
         return {"error": "unknown_tool",
                 "reason": f"there is no tool called '{call.name}'",
                 "available_tools": toolbox.names()}
@@ -148,8 +149,8 @@ def _dispatch(toolbox, call, trace, step):
     arguments = coerce_arguments(call.arguments, schema)
     problem = validate_arguments(arguments, schema)
     if problem is not None:
-        trace.write("tool_refused", step=step, tool=call.name,
-                    arguments=call.arguments, reason=problem)
+        trace.write("tool_refused", source="harness", step=step,
+                    tool=call.name, arguments=call.arguments, reason=problem)
         return {"error": "invalid_arguments", "reason": problem}
 
     started = time.time()
@@ -158,12 +159,13 @@ def _dispatch(toolbox, call, trace, step):
     except Exception as error:
         # A tool that throws is a harness failure, not a mission failure, but
         # the model is still the one that has to cope with it.
-        trace.write("tool_failed", step=step, tool=call.name,
+        trace.write("tool_failed", source="tool", step=step, tool=call.name,
                     arguments=arguments, reason=repr(error))
         return {"error": "tool_failed", "reason": str(error)}
 
     latency_ms = int((time.time() - started) * 1000)
-    trace.write("tool_result", step=step, tool=call.name, arguments=arguments,
+    trace.write("tool_result", source="tool", step=step, tool=call.name,
+                arguments=arguments,
                 result=result, latency_ms=latency_ms)
     return result
 

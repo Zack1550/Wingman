@@ -120,10 +120,18 @@ def plain(runs):
         for result in results:
             mark = {PASS: "  pass    ", DECLINED: "  declined",
                     FAIL: "  FAIL    "}[result["verdict"]]
+            # Results from before replanning carry no plan count; say nothing
+            # rather than implying they finished on the first plan.
+            plans = ""
+            if result.get("succeeded_on_plan"):
+                plans = f", plan {result['succeeded_on_plan']}"
+            elif result.get("plan_attempts", 0) > 1:
+                plans = f", {result['plan_attempts']} plans"
             lines.append(
                 f"{mark} {result['case']:30s} "
                 f"{result.get('model_seconds', 0):5.1f}s model  "
-                f"${result.get('cost_usd', 0):.3f}  {result['stop_reason']}")
+                f"${result.get('cost_usd', 0):.3f}  "
+                f"{result['stop_reason']}{plans}")
             if result["verdict"] == FAIL:
                 for check in result["checks"]:
                     if not check["ok"]:

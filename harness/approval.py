@@ -34,12 +34,18 @@ def needs_approval(tool, args):
 class ApprovalGate:
     """Base class. Subclasses decide; none of them ask a model."""
 
+    # Who the trace says decided. An eval's auto-grant is not an operator, and
+    # a trace that said so would misstate the one fact approval exists to record.
+    source = "approval_gate"
+
     def decide(self, approval, telemetry=None, rationale=""):
         raise NotImplementedError
 
 
 class ConsoleApprovalGate(ApprovalGate):
     """A human at a keyboard, which is the only kind that counts on Tuesday."""
+
+    source = "operator"
 
     def __init__(self, stream=None, prompt_stream=None):
         self._in = stream or sys.stdin
@@ -79,6 +85,8 @@ class ConsoleApprovalGate(ApprovalGate):
 class AutoApprovalGate(ApprovalGate):
     """For tests and dry runs. Never wire this to anything that can fly."""
 
+    source = "auto_approval"
+
     def __init__(self, grant=True):
         self.grant = grant
         self.seen = []
@@ -90,6 +98,8 @@ class AutoApprovalGate(ApprovalGate):
 
 class ScriptedApprovalGate(ApprovalGate):
     """Decisions in order, so a test can approve one step and refuse the next."""
+
+    source = "scripted_approval"
 
     def __init__(self, decisions):
         self.decisions = list(decisions)

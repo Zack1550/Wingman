@@ -101,8 +101,11 @@ class FakeGateway:
         operation_id = command.operation_id
         self.received_operation_ids.append(operation_id)
 
+        # Replay only what may have moved the vehicle, as the real gateway
+        # does. The fake has no unconfirmed outcomes, so that is acceptances;
+        # a retry of a rejection is evaluated again against reject_with.
         recorded = self._ledger.get(operation_id)
-        if recorded is not None:
+        if recorded is not None and recorded.status == vehicle_pb2.ACCEPTED:
             replay = vehicle_pb2.CommandAck()
             replay.CopyFrom(recorded)
             if recorded.status == vehicle_pb2.ACCEPTED:

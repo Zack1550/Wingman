@@ -143,12 +143,16 @@ airborne.
 The gateway's link can be made to **drop, duplicate, reorder and delay**, because
 a harness that has only run over loopback has never been tested. When an
 acknowledgement goes missing, the correct behaviour is neither to retry nor to
-report failure: the outcome is genuinely *unknown*. The client asks the gateway what it recorded for that specific `operation_id` and gets the original acknowledgement back verbatim — a lookup by key, not an inference from a state change, which matters the moment two things can command one aircraft. 
+report failure: the outcome is genuinely *unknown*. The client asks the gateway 
+what it recorded for that specific `operation_id` and gets the original acknowledgement
+back verbatim — a lookup by key, not an inference from a state change, which matters 
+the moment two things can command one aircraft. 
 
 Note:
-> In a recorded mission the aircraft was already descending 1.6 seconds after the command while the harness did not learn its command had landed for six more seconds. That window
-is not an error condition; it is the normal state of a distributed system, and every
-safety property here is designed to survive it.
+> In a recorded mission the aircraft was already descending 1.6 seconds after the 
+command while the harness did not learn its command had landed for six more seconds. 
+That window is not an error condition; it is the normal state of a distributed system,
+and every safety property here is designed to survive it.
 
 There are **two routes from a model to an aircraft**, and they differ in what
 stands between intent and action. The agent loop allows a model to request tool

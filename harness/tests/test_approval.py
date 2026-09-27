@@ -16,7 +16,7 @@ from harness.planner import Plan, PlanStep, validate_plan
 from harness.store import (APPLIED, APPROVAL_GRANTED, AWAITING_APPROVAL,
                            EXPIRED, FAILED, MissionStore, REJECTED, SUBMITTED,
                            UNKNOWN, args_fingerprint, canonical_args)
-from harness.trace import Trace
+from harness.trace import SOURCES, Trace
 from harness.tests.conftest import RUN, ready_client
 from mcp_server.tests.fake_gateway import FakeGateway, free_udp_port
 from vehicle_gateway.client import GatewayClient
@@ -216,9 +216,42 @@ def test_a_rejected_command_is_recorded_as_failed(store, client, tmp_path):
         rejecting = ready_client(gateway, port)
         result = Executor(store, AutoApprovalGate(grant=True),
                           client=rejecting).run(plan_of(takeoff_step()), RUN)
-        assert result.stop_reason == "binding_broken"
+        assert result.stop_reason == "step_rejected"
         assert store.commands_for_run(RUN)[0].state == FAILED
         rejecting.close()
+    finally:
+        gateway.stop()
+
+
+def test_a_retry_succeeds_once_the_vehicle_is_ready(store, tmp_path):
+    """"Not yet" followed by "yes", under one op_id and one approval.
+
+    The retry loop exists for exactly this, and for a while it could not do
+    it: the gateway replayed the first rejection to every retry.
+    """
+    import vehicle_pb2
+    port = free_udp_port()
+    gateway = FakeGateway(telemetry_port=port,
+                          reject_with=vehicle_pb2.REJECTED_RETRYABLE).start()
+    try:
+        ready = ready_client(gateway, port)
+        original = ready.send_command
+
+        def vehicle_becomes_ready(command, operation_id=None):
+            outcome = original(command, operation_id=operation_id)
+            gateway.reject_with = None     # ready from the next attempt on
+            return outcome
+
+        ready.send_command = vehicle_becomes_ready
+        result = Executor(store, AutoApprovalGate(grant=True), client=ready,
+                          retry_attempts=3, retry_wait_s=0.01).run(
+            plan_of(takeoff_step()), RUN)
+
+        assert result.completed, result.describe()
+        [record] = store.commands_for_run(RUN)
+        assert record.state == APPLIED
+        assert gateway.received_operation_ids == [record.op_id] * 2
+        ready.close()
     finally:
         gateway.stop()
 
@@ -333,6 +366,25 @@ def test_planner_cannot_smuggle_an_op_id(store, client, gateway):
     assert any("op_id" in problem for problem in plan.problems)
 
 
+
+def test_a_plan_without_tool_names_is_malformed_but_an_empty_one_is_not():
+    """Steps with no tool mean the model cannot plan; no steps means it declined.
+
+    The eval runner stops the suite on the first and grades the second, so the
+    two must not be confused. The first case is what granite4.1:3b produced.
+    """
+    class Box:
+        def __contains__(self, name):
+            return name == "takeoff"
+
+    toolless = validate_plan({"summary": "s", "steps": [
+        {"args": {"vehicle_id": "copter_1", "target_altitude_m": 15},
+         "rationale": "r", "risk": "high"}]}, Box())
+    declined = validate_plan({"summary": "battery is empty", "steps": []}, Box())
+
+    assert toolless.malformed and not toolless.is_valid
+    assert not declined.malformed and not declined.is_valid
+
 # --- evidence ---------------------------------------------------------------
 
 def test_the_trace_proves_the_refusal(store, client, gateway, tmp_path):
@@ -365,6 +417,31 @@ def test_the_trace_records_the_exact_approved_arguments(store, client, gateway,
         {"vehicle_id": "copter_1", "target_altitude_m": 31.0})
     submitted = next(e for e in events if e["event"] == "command_submitted")
     assert submitted["op_id"] == requested["op_id"]
+
+
+
+def test_every_trace_line_says_whose_data_it_is(store, client, gateway,
+                                               tmp_path):
+    """The executor writes these lines, but it is not the source of all of them.
+
+    The ack's status is the gateway's and the decision is the gate's. A trace
+    that attributed everything to the writer would say an eval's auto-grant
+    was the executor's idea, or that an operator approved it.
+    """
+    trace = Trace(directory=tmp_path, task="takeoff", provider="none")
+    Executor(store, AutoApprovalGate(grant=True), client=client,
+             trace=trace).run(plan_of(takeoff_step()), RUN)
+    trace.close()
+
+    events = [json.loads(line) for line in trace.path.read_text().splitlines()]
+    assert all(event.get("source") in SOURCES for event in events), \
+        [(e["event"], e.get("source")) for e in events]
+
+    source = {e["event"]: e["source"] for e in events}
+    assert source["command_proposed"] == "executor"
+    assert source["approval_decided"] == "auto_approval"
+    assert source["command_submitted"] == "executor"
+    assert source["command_outcome"] == "gateway"
 
 
 # --- a read is a step, and its result is evidence ---------------------------
@@ -408,7 +485,7 @@ def test_a_read_that_errors_fails_the_run(store, client):
         plan_of(read_step(target_altitude_m=20.0)), RUN)
 
     assert not result.completed, "a failed confirmation is not a completed run"
-    assert result.stop_reason == "binding_broken"
+    assert result.stop_reason == "step_unconfirmed"
     assert result.outcomes[0].status == "failed"
     assert "19.5s old" in result.outcomes[0].reason
 
@@ -479,7 +556,7 @@ def test_a_stale_approval_does_not_overwrite_newer_state(store, client,
     result = Executor(store, GateThatLetsTheWorldMove(),
                       client=client).run(plan_of(takeoff_step()), RUN)
 
-    assert result.stop_reason == "binding_broken"
+    assert result.stop_reason == "approval_void"
     assert result.outcomes[0].status == "expired"
     assert "state_version" in result.outcomes[0].reason
     # The competing set_mode flew; the stale takeoff did not.

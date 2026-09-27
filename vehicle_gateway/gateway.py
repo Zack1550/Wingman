@@ -8,8 +8,8 @@ MAV_CMD numbers, the fact that "go here" is a setpoint rather than a command,
 and the fact that ArduPilot sends no telemetry until a ground station asks.
 
 One rule runs through the whole file: an Ack means the vehicle ACCEPTED a
-command, never that the manoeuvre finished. Telemetry is the only ground truth
-for what the vehicle actually did. That distinction is what makes a dropped ack
+command, never that the manoeuvre finished. Telemetry is the truth for what
+the vehicle actually did. That distinction is what makes a dropped ack
 survivable instead of a guess.
 
     harness  --UDP 14550-->  [command port]  \
@@ -20,6 +20,7 @@ Run it:
     python gateway.py                    # an honest link
     python gateway.py --drop-first-ack   # the vehicle moves, the client is blind
 """
+
 import argparse
 import random
 import socket
@@ -83,6 +84,12 @@ COMMON_MODES = ("GUIDED", "LOITER", "RTL", "LAND", "ALT_HOLD", "STABILIZE", "AUT
 NON_ARMABLE_MODES = {"RTL", "LAND", "AUTO", "AUTO_RTL", "SMART_RTL", "BRAKE",
                      "THROW", "FLIP"}
 STATUS_RELEVANT_FOR_S = 6.0        # how far back a rejection looks for a reason
+
+# Not a CommandStatus. The gateway's own word for "sent to the vehicle, and not
+# confirmed either way": no COMMAND_ACK, or an ack the readback never matched.
+# It goes out on the wire as REJECTED_RETRYABLE, but unlike a real rejection it
+# may have moved the aircraft, and the ledger has to treat it that way.
+UNCONFIRMED = "unconfirmed"
 
 
 def now_unix_ms():
@@ -253,6 +260,13 @@ class CommandLedger:
     answer it already gave and replays it instead of acting twice. A retry
     after a dropped ack must move the vehicle exactly zero additional times.
 
+    Replay is for anything that may have moved the vehicle: an acceptance, or a
+    command sent without confirmation. A definite rejection moved nothing, so
+    a retry of it is evaluated again. Replaying those too meant "not armed yet"
+    was answered from the ledger forever, even after the aircraft armed, and
+    every retry the executor made was a replay of the first "no". The rejection
+    stays recorded either way, so a status query still gets the truth.
+
     In memory, so a gateway restart forgets. A real vehicle would need this in
     non-volatile storage with a bounded horizon; say so out loud rather than
     pretending loopback proved otherwise.
@@ -261,22 +275,33 @@ class CommandLedger:
     def __init__(self):
         self._lock = threading.Lock()
         self._acks_by_operation = {}
+        self._may_have_applied = set()
 
-    def remember(self, ack):
+    def remember(self, ack, may_have_applied):
         with self._lock:
             self._acks_by_operation[ack.operation_id] = ack
+            if may_have_applied:
+                self._may_have_applied.add(ack.operation_id)
+            else:
+                self._may_have_applied.discard(ack.operation_id)
 
     def lookup(self, operation_id):
         with self._lock:
             return self._acks_by_operation.get(operation_id)
 
+    def must_replay(self, operation_id):
+        """True if re-executing this operation could apply it twice."""
+        with self._lock:
+            return operation_id in self._may_have_applied
+
     def replay(self, original_ack):
         """The answer to a duplicate: the original outcome, marked as a repeat.
 
         A duplicate of an accepted command reports ALREADY_APPLIED so the client
-        can tell "it worked" from "it worked, twice asked". A duplicate of a
-        rejection replays the rejection verbatim, because the reason is what the
-        model needs and ALREADY_APPLIED would be a lie.
+        can tell "it worked" from "it worked, twice asked". A duplicate of an
+        unconfirmed command replays its answer verbatim, because the reason is
+        what the model needs and ALREADY_APPLIED would be a lie. Definite
+        rejections never get here; they are evaluated again.
         """
         replayed = vehicle_pb2.CommandAck()
         replayed.CopyFrom(original_ack)
@@ -592,13 +617,20 @@ class Gateway:
         action = command.WhichOneof('action')
         log(f"command {operation_id} {command.vehicle_id} {action}")
 
-        # 1. Duplicate? Answer from the ledger and touch nothing.
+        # 1. Duplicate of something that may have moved the vehicle? Answer
+        #    from the ledger and touch nothing. A duplicate of a definite
+        #    rejection is a retry, and the world it was refused in may have
+        #    changed since, so it falls through and is evaluated again.
         recorded = self.ledger.lookup(operation_id)
-        if recorded is not None:
+        if recorded is not None and self.ledger.must_replay(operation_id):
             log(f"  duplicate of a command already answered "
                 f"({vehicle_pb2.CommandStatus.Name(recorded.status)})")
             self._reply(self.ledger.replay(recorded), reply_address)
             return
+        if recorded is not None:
+            log(f"  retry of a command refused without effect "
+                f"({vehicle_pb2.CommandStatus.Name(recorded.status)}); "
+                f"evaluating it again")
 
         vehicle = self.bridge.vehicles_by_id.get(command.vehicle_id)
         if vehicle is None:
@@ -638,8 +670,11 @@ class Gateway:
                          reply_address)
             return
 
-        # 4. Do the thing.
+        # 4. Do things
         status, reason = self._execute(action, command, vehicle)
+        may_have_applied = status in (vehicle_pb2.ACCEPTED, UNCONFIRMED)
+        if status == UNCONFIRMED:
+            status = vehicle_pb2.REJECTED_RETRYABLE
 
         # A rejection is only useful if it says what to do instead, and the
         # aircraft usually just told us. Pass its words on rather than logging
@@ -651,9 +686,10 @@ class Gateway:
 
         # state_version moves only when the vehicle actually took the command,
         # so a client can count accepted writes and compare.
-        version = (vehicle.bump_state_version() if status == vehicle_pb2.ACCEPTED
-                   else current_version)
-        self._finish(command, status, reason, version, reply_address)
+        version = vehicle.bump_state_version() if status == vehicle_pb2.ACCEPTED
+                   else current_version
+        self._finish(command, status, reason, version, reply_address,
+                     may_have_applied=may_have_applied)
 
     def _execute(self, action, command, vehicle):
         if action == 'arm':
@@ -670,8 +706,8 @@ class Gateway:
                         f"unknown flight mode '{mode_name}'; this vehicle "
                         f"accepts {', '.join(COMMON_MODES)}")
             ok, reason = self.bridge.send_mode_change(vehicle, mode_name)
-            return (vehicle_pb2.ACCEPTED if ok
-                    else vehicle_pb2.REJECTED_RETRYABLE), reason
+            # Not confirmed is not refused: the mode may still change.
+            return (vehicle_pb2.ACCEPTED if ok else UNCONFIRMED), reason
         if action == 'takeoff':
             return self._takeoff(vehicle, command.takeoff.target_altitude_m)
         if action == 'goto_position':
@@ -706,7 +742,7 @@ class Gateway:
         # set_mode does, so ACCEPTED means the same thing for every command.
         if self.bridge.await_armed_state(vehicle, arm):
             return vehicle_pb2.ACCEPTED, f"confirmed {what}ed"
-        return (vehicle_pb2.REJECTED_RETRYABLE,
+        return (UNCONFIRMED,
                 f"vehicle acknowledged the {what} but had not reported it "
                 f"within {ARM_CONFIRM_TIMEOUT_S}s; read telemetry before retrying")
 
@@ -763,7 +799,7 @@ class Gateway:
         if mav_result is None:
             # The gateway does not know. Saying so, and making the retry safe,
             # beats inventing either a success or a failure.
-            return (vehicle_pb2.REJECTED_RETRYABLE,
+            return (UNCONFIRMED,
                     f"no COMMAND_ACK for {what} within "
                     f"{MAVLINK_ACK_TIMEOUT_S}s; it may still have applied — "
                     f"read telemetry, and retry with the same operation_id")
@@ -771,7 +807,8 @@ class Gateway:
         status = MAV_RESULT_TO_STATUS.get(mav_result, vehicle_pb2.REJECTED_PERMANENT)
         return status, f"vehicle answered {name} to {what}"
 
-    def _finish(self, command, status, reason, state_version, reply_address):
+    def _finish(self, command, status, reason, state_version, reply_address,
+                may_have_applied=False):
         ack = vehicle_pb2.CommandAck(
             operation_id=command.operation_id,
             vehicle_id=command.vehicle_id,
@@ -782,7 +819,7 @@ class Gateway:
         )
         # Recorded BEFORE it is sent. If the send is dropped the gateway must
         # still be able to answer "what happened to this operation?"
-        self.ledger.remember(ack)
+        self.ledger.remember(ack, may_have_applied)
         log(f"  -> {vehicle_pb2.CommandStatus.Name(status)}: {reason}")
         self._reply(ack, reply_address, droppable=True)
 

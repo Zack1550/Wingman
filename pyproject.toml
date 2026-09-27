@@ -1,0 +1,29 @@
+[project]
+name = "wingman"
+version = "0.1.0"
+description = "Natural-language mission harness for ArduPilot SITL: plan as data, approve per command, grade from evidence."
+readme = "README.md"
+requires-python = ">=3.12"
+# Pinned to the versions the harness was built and evaluated against,
+# recovered from the uv cache after the original .venv was removed. The mcp
+# pin matters most: the tool server uses `mcp.server.MCPServer`, which older
+# SDKs do not have.
+dependencies = [
+    "anthropic==1.5.0",
+    "mcp==2.2.0",
+    "ollama==0.6.2",
+    "protobuf==7.36.1",
+    "pymavlink==2.4.49",
+]
+
+[project.optional-dependencies]
+# observability/build_mcap.py only. Never installed in the original
+# environment, so unpinned.
+observability = ["foxglove-sdk"]
+
+[dependency-groups]
+dev = ["pytest==9.1.1"]
+
+[tool.uv]
+# An application run from the repo root, not a library to install.
+package = false

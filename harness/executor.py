@@ -65,8 +65,8 @@ class StepOutcome:
 @dataclass
 class ExecutionResult:
     run_id: str
-    stop_reason: str          # completed | refused | blocked | binding_broken
-                              # | error
+    stop_reason: str          # completed | refused | blocked | approval_void
+                              # | step_rejected | step_unconfirmed | error
     outcomes: list = field(default_factory=list)
 
     @property
@@ -154,8 +154,17 @@ class Executor:
                 # or quietly moving to the next step, would both treat "no"
                 # as a negotiating position.
                 return ExecutionResult(run_id, "refused", outcomes)
-            if outcome.status in ("expired", "failed"):
-                return ExecutionResult(run_id, "binding_broken", outcomes)
+            if outcome.status == "expired":
+                # The approval no longer covers the command: it lapsed, or the
+                # arguments or the world changed while the operator decided.
+                return ExecutionResult(run_id, "approval_void", outcomes)
+            if outcome.status == "failed":
+                # Two different failures, named apart so a result says which:
+                # the vehicle refused a write, or a read or wait did not
+                # confirm what the plan needed it to.
+                reason = ("step_rejected" if step.tool in WRITE_TOOLS
+                          else "step_unconfirmed")
+                return ExecutionResult(run_id, reason, outcomes)
         return ExecutionResult(run_id, "completed", outcomes)
 
     def _run_step(self, index, step, run_id):
@@ -166,8 +175,9 @@ class Executor:
         version = self.current_version(vehicle_id)
         command = self.store.propose(run_id, vehicle_id, step.tool, step.args,
                                      state_version=version)
-        self._trace("command_proposed", index=index, op_id=command.op_id,
-                    tool=step.tool, args=step.args, state_version=version)
+        self._trace("command_proposed", "executor", index=index,
+                    op_id=command.op_id, tool=step.tool, args=step.args,
+                    state_version=version)
 
         # Constraints before approval, deliberately. Asking a human to approve
         # something the system will refuse anyway teaches them the prompt is
@@ -178,9 +188,9 @@ class Executor:
         if refusal is not None:
             self.store.set_state(command.op_id, REJECTED,
                                  reason=f"{refusal.rule}: {refusal.reason}")
-            self._trace("command_blocked", index=index, op_id=command.op_id,
-                        tool=step.tool, rule=refusal.rule,
-                        reason=refusal.reason)
+            self._trace("command_blocked", "constraints", index=index,
+                        op_id=command.op_id, tool=step.tool,
+                        rule=refusal.rule, reason=refusal.reason)
             return StepOutcome(index, step.tool, step.args, "blocked",
                                f"{refusal.rule}: {refusal.reason}",
                                command.op_id, "", refusal.as_dict())
@@ -189,7 +199,7 @@ class Executor:
         if needs_approval(step.tool, step.args):
             approval = self.store.request_approval(command,
                                                    ttl_s=self.approval_ttl_s)
-            self._trace("approval_requested", index=index,
+            self._trace("approval_requested", "executor", index=index,
                         approval_id=approval.approval_id, op_id=command.op_id,
                         tool=step.tool, args=canonical_args(step.args),
                         state_version=version)
@@ -198,7 +208,9 @@ class Executor:
                 approval, telemetry=self.telemetry_or_none(vehicle_id),
                 rationale=step.rationale)
             approval = self.store.decide(approval.approval_id, granted, note)
-            self._trace("approval_decided", approval_id=approval.approval_id,
+            self._trace("approval_decided",
+                        getattr(self.gate, "source", "approval_gate"),
+                        approval_id=approval.approval_id,
                         granted=granted, op_id=command.op_id)
 
             if not granted:
@@ -214,7 +226,8 @@ class Executor:
             covered, why = approval.covers(step.tool, step.args, fresh_version)
             if not covered:
                 self.store.set_state(command.op_id, EXPIRED, reason=why)
-                self._trace("approval_invalidated", op_id=command.op_id,
+                self._trace("approval_invalidated", "executor",
+                            op_id=command.op_id,
                             approval_id=approval.approval_id, reason=why)
                 return StepOutcome(index, step.tool, step.args, "expired", why,
                                    command.op_id, approval.approval_id)
@@ -229,8 +242,8 @@ class Executor:
         # Written before the datagram leaves. If the process dies between here
         # and the ack, the record is what lets a restart find out what happened.
         self.store.set_state(command.op_id, SUBMITTED)
-        self._trace("command_submitted", index=index, op_id=command.op_id,
-                    tool=step.tool, args=step.args)
+        self._trace("command_submitted", "executor", index=index,
+                    op_id=command.op_id, tool=step.tool, args=step.args)
 
         # Retries reuse the op_id, which is what makes them free: the gateway
         # deduplicates, so a command that did land is replayed rather than
@@ -242,9 +255,9 @@ class Executor:
                 break
             if attempt == self.retry_attempts:
                 break
-            self._trace("command_retrying", index=index, op_id=command.op_id,
-                        attempt=attempt, reason=outcome.reason,
-                        waiting_s=self.retry_wait_s)
+            self._trace("command_retrying", "executor", index=index,
+                        op_id=command.op_id, attempt=attempt,
+                        reason=outcome.reason, waiting_s=self.retry_wait_s)
             time.sleep(self.retry_wait_s)
 
         status = {"accepted": APPLIED, "rejected": FAILED,
@@ -254,7 +267,11 @@ class Executor:
         if outcome.status == "accepted" and outcome.state_version:
             self._version_from_ack[vehicle_id] = outcome.state_version
 
-        self._trace("command_outcome", index=index, op_id=command.op_id,
+        # The gateway's answer, unless it never gave one: an unknown that was
+        # not reconciled is the client concluding something from silence.
+        heard = outcome.status != "unknown" or outcome.reconciled
+        self._trace("command_outcome", "gateway" if heard else "harness",
+                    index=index, op_id=command.op_id,
                     status=status, reason=outcome.reason,
                     state_version=outcome.state_version,
                     reconciled=outcome.reconciled)
@@ -286,7 +303,7 @@ class Executor:
             result = self.toolbox.call(step.tool, step.args)
             if not isinstance(result, dict):
                 result = {"result": result}
-            self._trace("read_result", index=index, tool=step.tool,
+            self._trace("read_result", "tool", index=index, tool=step.tool,
                         args=step.args, result=result, attempt=attempt)
 
             if "error" in result:
@@ -308,8 +325,8 @@ class Executor:
                         or f"{waiting[0]} was still false after "
                            f"{self.retry_attempts} attempts"),
                     "", "", result)
-            self._trace("read_retrying", index=index, tool=step.tool,
-                        attempt=attempt, result=result)
+            self._trace("read_retrying", "executor", index=index,
+                        tool=step.tool, attempt=attempt, result=result)
 
     @staticmethod
     def _build(tool, args, expected_state_version=0):
@@ -319,9 +336,9 @@ class Executor:
             fields["expected_state_version"] = expected_state_version
         return GatewayClient.build(args["vehicle_id"], action, **fields)
 
-    def _trace(self, event, **fields):
+    def _trace(self, event, source, **fields):
         if self.trace is not None:
-            self.trace.write(event, **fields)
+            self.trace.write(event, source=source, **fields)
 
 
 # --- recovery ---------------------------------------------------------------
@@ -358,6 +375,10 @@ def reconcile_outstanding(store, client, trace=None):
 
         resolved.append((command.op_id, outcome))
         if trace is not None:
-            trace.write("reconciled", op_id=command.op_id, outcome=outcome,
+            # still_unknown means the gateway never answered, so the
+            # conclusion is ours; every other outcome is what it recorded.
+            trace.write("reconciled",
+                        source="harness" if status is None else "gateway",
+                        op_id=command.op_id, outcome=outcome,
                         tool=command.tool)
     return resolved
