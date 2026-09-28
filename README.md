@@ -14,17 +14,32 @@ the simulator: the simulated battery drains by flying and persists across runs,
 so without a reset the twelfth mission is flown by a different aircraft than the
 first.
 
-| Model | Cases | Acceptable | Fail | Median model time | Median wall time | Cost | Cost/case |
-|---|---|---|---|---|---|---|---|
-| `claude-sonnet-5` | 12 | **12/12 (100%)** | 0 | 10 s | 131 s | $0.19 | $0.016 |
-| `granite4.1:3b` (local) | 12 | **3/12 (25%)** | 9 | 68 s | 179 s | $0.00 | $0.000 |
+| Model | Run | Acceptable | Really finished | Blocked (correct) | Finished on plan 1 / 2 / 3 | Median model time | Median wall time | Cost/case |
+|---|---|---|---|---|---|---|---|---|
+| `claude-sonnet-5` | 2026-09-28 | **12/12** | 10 | 2 | 10 / 0 / 0 | 14 s | 86 s | $0.016 |
+| `qwen2.5:7b-instruct-q4_K_M` (local) | 2026-09-28 | **11/12** | 7 | 2 | 6 / 0 / 1 | 123 s | 195 s | $0.000 |
+| `granite4.1:3b` (local) | 2026-09-13, one plan per mission | **3/12** | 2 | 0 | — | 67 s | 172 s | $0.000 |
 
-Median wall time includes the ~90 s reset, which is a property of this laptop
-rather than of either model. Underneath the missions, **149 layer-one tests run
-in ~20 s** against an in-process fake gateway, with no Docker needed. It does not yet persist the dedup ledger across restart, reconnect a dead link, run missions concurrently, enforce battery, or plan without an internet model; see Known gaps.
+*Acceptable* is the grader's verdict. *Really finished* counts missions that
+actually completed, and *blocked* the ones a limit correctly refused. The gap
+between acceptable and those two is cases whose checks let a mission that never
+happened pass: two of qwen's, one of granite's. A mission gets up to three plans:
+when the vehicle refuses a step, the model plans again with the vehicle's reason.
+Median wall time includes the ~50 s simulator reset (about 90 s in granite's
+run), which is a property of this laptop rather than of any model.
 
-**Where the local model fails is more interesting than the rate.** Five of
-granite's nine failures are `no_plan` — it could not turn the mission into an
+**Every result is kept as an experiment, not a table.** Each one in
+[`evals/outcomes/`](evals/outcomes/README.md) is a frozen baseline, one change
+and the result, with the code that produced each side; the numbers above come
+from the latest. [`evals/outcomes/index.csv`](evals/outcomes/index.csv) holds
+every run of every outcome, measured the same way, and grows as outcomes are
+added.
+
+Underneath the missions, **164 layer-one tests run in ~22 s** against an
+in-process fake gateway, with no Docker needed. It does not yet persist the dedup ledger across restart, reconnect a dead link, run missions concurrently, enforce battery, or plan without an internet model; see Known gaps.
+
+**Where the local model fails is more interesting than the rate.** In granite's
+2026-09-13 run, before replanning, five of its nine failures are `no_plan` — it could not turn the mission into an
 ordered structure at all. The other four produced a plan that broke during
 execution. It reads state and reports it correctly (`read_only`: 1/1); it cannot
 reliably plan (`takeoff_hover`, `state_aware`, `land_recover`, `navigate`: 0/2,
@@ -71,7 +86,7 @@ simulator unchanged: **the gateway stays the only writer to the flight
 controller.**
 
 **The rover gets built first.** Every genuinely hard problem left here is
-software — the local model that scored 3/12, the state machine, plan-level
+software — a local model that plans reliably (qwen2.5:7b: 11/12, granite: 3/12), the state machine, plan-level
 approval, the follow controller, the phone app — and none of it cares whether
 the vehicle has wheels or props. On a rover you can debug all of it walking
 alongside at two miles an hour with a kill switch in your hand, five hours to a
@@ -174,16 +189,20 @@ JSONL line per event — plan, approval, dispatch, outcome, model latency,
 reasoning summary — and a separate recorder captures the 5 Hz telemetry
 broadcast, which merge into a single MCAP file so agent decisions and aircraft
 behaviour sit on one scrubbable clock in Foxglove. Correctness is judged from
-that evidence rather than from the model's closing paragraph: 149 layer-one tests
-run in 20 seconds against an in-process fake gateway with no Docker, and twelve
+that evidence rather than from the model's closing paragraph: 164 layer-one tests
+run in about 22 seconds against an in-process fake gateway with no Docker, and twelve
 end-to-end missions grade to three verdicts — pass, correctly declined, or fail —
 because a refusal only counts if the reason it gave was true.
 
 ## Quick start
 
-Requires Docker, Python 3.12 and (optionally) Ollama.
+Requires Docker, Python 3.12, [uv](https://docs.astral.sh/uv/) and (optionally) Ollama.
 
 ```bash
+# 0. dependencies, pinned in pyproject.toml and uv.lock; run everything below
+#    through `uv run` or from the activated .venv
+uv sync
+
 # 1. the simulator: two copters behind mavlink-router on tcp/5760
 cd ardupilot_sitl_docker/stacks/n_copters
 docker compose -f docker-compose-2.yml up -d
@@ -193,7 +212,7 @@ cd -
 python vehicle_gateway/gateway.py
 
 # 3. layer-one tests — no Docker needed, they run against an in-process fake
-pytest                                    # 149 tests, ~20 s
+pytest                                    # 164 tests, ~22 s
 
 # 4. a mission, with an approval prompt per risky command
 export ANTHROPIC_API_KEY=...
@@ -287,7 +306,8 @@ WSL2/Docker/SITL and not this code. Every timeout sits above that floor;
 **Two model calls, not eight.** A mission costs $0.016 on the plan-then-execute
 path against roughly $0.12 on the agent loop, because the loop resends the whole
 conversation every step while the plan path calls the model twice. An 8×
-difference from an architecture choice rather than a model choice.
+difference from an architecture choice rather than a model choice. A replan adds
+one call per extra plan, so a mission that needs all three plans makes four.
 
 ## Known gaps
 

@@ -1,0 +1,35 @@
+{
+  "slug": "2026-09-28-replanning",
+  "question": "Does giving the model up to three plans per mission (the original plus two replans after a vehicle rejection) change the results?",
+  "change": "Replanning: when the vehicle refuses a step or a wait does not confirm, plan again with the reason, up to three plans (harness/replan.py).",
+  "baseline": {
+    "anthropic:claude-sonnet-5": {
+      "file": "runs/baseline/anthropic-claude-sonnet-5.json",
+      "code": "pre-git (2026-09-13, before the first commit)",
+      "run_on": "2026-09-13 14:24"
+    },
+    "ollama:qwen2.5:7b-instruct-q4_K_M": {
+      "file": "runs/baseline/ollama-qwen2.5:7b-instruct-q4_K_M.json",
+      "code": "0d030b6+uncommitted",
+      "run_on": "2026-09-25 23:33"
+    }
+  },
+  "result": {
+    "anthropic:claude-sonnet-5": {
+      "file": "runs/result/anthropic-claude-sonnet-5.json",
+      "code": "a9bb77c",
+      "run_on": "2026-09-28 09:23"
+    },
+    "ollama:qwen2.5:7b-instruct-q4_K_M": {
+      "file": "runs/result/ollama-qwen2.5:7b-instruct-q4_K_M.json",
+      "code": "a9bb77c",
+      "run_on": "2026-09-28 09:41"
+    }
+  },
+  "also_changed": [
+    "Gateway re-evaluates a retried definite rejection instead of replaying it (both models).",
+    "Stop reasons renamed: binding_broken split into step_rejected / step_unconfirmed / approval_void (both models).",
+    "Trace lines carry a source field (both models).",
+    "Simulator reset ~90 s -> ~50 s (Sonnet only; the qwen baseline already had it)."
+  ]
+}
