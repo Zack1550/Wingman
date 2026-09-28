@@ -18,6 +18,7 @@ Three ideas carry the weight:
   Stale is not fresh.  Telemetry has an age. Past a threshold we say the vehicle
   is unreachable rather than hand back the last thing we happened to hear.
 """
+
 import socket
 import sys
 import threading

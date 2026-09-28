@@ -686,8 +686,8 @@ class Gateway:
 
         # state_version moves only when the vehicle actually took the command,
         # so a client can count accepted writes and compare.
-        version = vehicle.bump_state_version() if status == vehicle_pb2.ACCEPTED
-                   else current_version
+        version = (vehicle.bump_state_version() if status == vehicle_pb2.ACCEPTED
+                   else current_version)
         self._finish(command, status, reason, version, reply_address,
                      may_have_applied=may_have_applied)
 

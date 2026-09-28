@@ -8,7 +8,7 @@ returns "not armed; call arm first" teaches it exactly one thing.
 
 Three rules hold throughout:
 
-  Structured, never prose.  Every tool returns a dict. Nothing returns an
+  Structured, never prose. Every tool returns a dict. Nothing returns an
   English sentence for the model to parse back into a decision.
 
   Runtime fields are not model-facing.  op_id is assigned here, by the host, and
@@ -16,7 +16,7 @@ Three rules hold throughout:
   operation ids could defeat deduplication by varying them, or replay someone
   else's by guessing them.
 
-  Unreachable is not the same as unchanged.  A dead gateway returns a structured
+  Unreachable is not the same as unchanged. A dead gateway returns a structured
   error saying so. It never returns the last telemetry we happened to hear.
 
 Run:
@@ -40,9 +40,9 @@ from vehicle_gateway.client import (                           # noqa: E402
 mcp = MCPServer(
     "vehicle-gateway",
     instructions=(
-        "Commands simulated multirotor aircraft through a UDP gateway. "
+        "Commands multirotor aircraft through a UDP gateway. "
         "Telemetry is the only ground truth: an accepted command means the "
-        "vehicle took it, not that the manoeuvre finished. After any write, "
+        "vehicle took it, not that the maneuver finished. After any write, "
         "read get_telemetry to confirm the effect before reporting success. "
         "A command whose status is 'unknown' may or may not have applied — "
         "never assume either way; call get_command_status or read telemetry."
