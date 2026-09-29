@@ -35,8 +35,8 @@ from the latest. [`evals/outcomes/index.csv`](evals/outcomes/index.csv) holds
 every run of every outcome, measured the same way, and grows as outcomes are
 added.
 
-Underneath the missions, **164 layer-one tests run in ~22 s** against an
-in-process fake gateway, with no Docker needed. It does not yet persist the dedup ledger across restart, reconnect a dead link, run missions concurrently, enforce battery, or plan without an internet model; see Known gaps.
+Underneath the missions, **166 layer-one tests run in ~25 s** against an
+in-process fake gateway, with no Docker needed. It does not yet run missions concurrently, enforce battery, or plan without an internet model; see Known gaps.
 
 **Where the local model fails is more interesting than the rate.** In granite's
 2026-09-13 run, before replanning, five of its nine failures are `no_plan` — it could not turn the mission into an
@@ -189,8 +189,8 @@ JSONL line per event — plan, approval, dispatch, outcome, model latency,
 reasoning summary — and a separate recorder captures the 5 Hz telemetry
 broadcast, which merge into a single MCAP file so agent decisions and aircraft
 behaviour sit on one scrubbable clock in Foxglove. Correctness is judged from
-that evidence rather than from the model's closing paragraph: 164 layer-one tests
-run in about 22 seconds against an in-process fake gateway with no Docker, and twelve
+that evidence rather than from the model's closing paragraph: 166 layer-one tests
+run in about 25 seconds against an in-process fake gateway with no Docker, and twelve
 end-to-end missions grade to three verdicts — pass, correctly declined, or fail —
 because a refusal only counts if the reason it gave was true.
 
@@ -208,11 +208,13 @@ cd ardupilot_sitl_docker/stacks/n_copters
 docker compose -f docker-compose-2.yml up -d
 cd -
 
-# 2. the gateway (wait ~60 s first for the EKF to settle)
+# 2. the gateway (wait ~60 s first for the EKF to settle). Its op_id ledger
+#    persists in gateway_ledger.sqlite3; if the router or simulator restarts,
+#    it reconnects by itself
 python vehicle_gateway/gateway.py
 
 # 3. layer-one tests — no Docker needed, they run against an in-process fake
-pytest                                    # 164 tests, ~22 s
+pytest                                    # 166 tests, ~25 s
 
 # 4. a mission, with an approval prompt per risky command
 export ANTHROPIC_API_KEY=...
@@ -311,12 +313,13 @@ one call per extra plan, so a mission that needs all three plans makes four.
 
 ## Known gaps
 
-- **The gateway's dedup ledger is in memory.** Restart it and every
-  `operation_id` is forgotten, so a retry across that boundary will re-execute.
-  A real vehicle needs this in non-volatile storage with a bounded horizon.
-- **The gateway cannot reconnect a dead MAVLink link.** It stops broadcasting
-  and says `LINK DOWN` rather than serving stale state, which is the important
-  half, but it still needs a restart.
+- **The gateway's ledger forgets after 24 hours.** It lives in SQLite
+  (`gateway_ledger.sqlite3`) with each vehicle's `state_version`, so a gateway
+  killed mid-mission comes back knowing every answer it gave; a test kills the
+  process after an unacknowledged arm and checks the aircraft is armed exactly
+  once. Past the 24 h horizon an `operation_id` is pruned, a status query says
+  it was never seen, and a resend would run it. The horizon is policy; it has
+  to outlast any client's retries and any harness outage before reconciling.
 - **Missions are sequential.** `wait_for_position` blocks, so "Bravo holds until
   Alpha arrives" is expressed as ordering, not concurrency. Real concurrency
   needs per-vehicle lanes in the executor.

@@ -24,6 +24,7 @@ Run it:
 import argparse
 import random
 import socket
+import sqlite3
 import sys
 import threading
 import time
@@ -50,6 +51,21 @@ ARM_CONFIRM_TIMEOUT_S = 8.0         # same again: heartbeats are only 1 Hz
 TELEMETRY_HZ = 5.0
 HEARTBEAT_HZ = 1.0                  # what every MAVLink endpoint owes the network
 STALE_COMMAND_AGE_MS = 30_000       # older than this and the world has moved on
+# How long the ledger remembers an operation_id. Policy, not a tuning knob:
+# chosen as 24 h so a harness that crashes and is restarted the next morning
+# can still ask what became of its outstanding commands. A forgotten op_id
+# retried later would run again, so this must outlast the longest time any
+# client keeps retrying one: the executor's retries span about 40 s, and a
+# restarted harness only queries status, it never resends. The stale-command
+# age check does not cover this, because the client stamps issued_at afresh
+# on every send; it only catches delayed datagrams.
+LEDGER_HORIZON_S = 24 * 3600
+DEFAULT_LEDGER_PATH = Path(__file__).resolve().parent.parent / "gateway_ledger.sqlite3"
+# How often the bridge tries the router again once the link is down, and how
+# long it waits for a heartbeat on each try. Recovery is then bounded by one
+# interval, one heartbeat period (1 Hz) and the first telemetry after it.
+RECONNECT_INTERVAL_S = 1.0
+RECONNECT_HEARTBEAT_WAIT_S = 2.0
 # If MAVLink has said nothing about a vehicle for this long, we do not know what
 # it is doing and must stop saying that we do. Comfortably above the measured
 # transport stall, so a hiccup is not reported as a missing aircraft.
@@ -116,6 +132,10 @@ class VehicleState:
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     heard_from: bool = False
+    # A position reported since the gateway last (re)connected. Until then the
+    # latitude and longitude are defaults (0, 0) or from before a dropped link,
+    # and broadcasting either would present a guess as a measurement.
+    position_known: bool = False
     last_message_at: float = 0.0      # wall clock of the last MAVLink message
     latitude_deg: float = 0.0
     longitude_deg: float = 0.0
@@ -267,32 +287,91 @@ class CommandLedger:
     every retry the executor made was a replay of the first "no". The rejection
     stays recorded either way, so a status query still gets the truth.
 
-    In memory, so a gateway restart forgets. A real vehicle would need this in
-    non-volatile storage with a bounded horizon; say so out loud rather than
-    pretending loopback proved otherwise.
+    On disk, so a restart forgets nothing inside the horizon. It used to be a
+    dict, and a gateway restarted mid-mission would run a retried command a
+    second time. Each vehicle's state_version is stored in the same
+    transaction as the ack that moved it: a restart that kept the answers but
+    reset the versions to 0 would refuse every later command as stale.
+
+    Entries older than the horizon are pruned. After that a status query says
+    the operation was never seen and a resend would run it, which is why the
+    horizon has to outlast any client's retries and any plausible outage.
     """
 
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._acks_by_operation = {}
-        self._may_have_applied = set()
+    SCHEMA = """
+    CREATE TABLE IF NOT EXISTS acks (
+        operation_id TEXT PRIMARY KEY,
+        ack BLOB NOT NULL,
+        may_have_applied INTEGER NOT NULL,
+        recorded_at_ms INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS acks_by_age ON acks(recorded_at_ms);
+    CREATE TABLE IF NOT EXISTS versions (
+        vehicle_id TEXT PRIMARY KEY,
+        state_version INTEGER NOT NULL
+    );
+    """
 
-    def remember(self, ack, may_have_applied):
-        with self._lock:
-            self._acks_by_operation[ack.operation_id] = ack
-            if may_have_applied:
-                self._may_have_applied.add(ack.operation_id)
-            else:
-                self._may_have_applied.discard(ack.operation_id)
+    def __init__(self, path=None, horizon_s=LEDGER_HORIZON_S):
+        """path=None keeps it in memory, for tests that are not about restarts."""
+        self.path = str(path) if path else ":memory:"
+        self.horizon_s = horizon_s
+        self._lock = threading.Lock()
+        self._db = sqlite3.connect(self.path, check_same_thread=False)
+        # Written before the ack is sent, so it has to reach the disk before
+        # the ack does: FULL makes each commit durable, not merely queued.
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("PRAGMA synchronous=FULL")
+        self._db.executescript(self.SCHEMA)
+        self.prune()
+
+    def remember(self, ack, may_have_applied, vehicle_version=None):
+        """Record an answer, and the version it moved the vehicle to, together."""
+        with self._lock, self._db:
+            self._db.execute(
+                "INSERT OR REPLACE INTO acks VALUES (?, ?, ?, ?)",
+                (ack.operation_id, ack.SerializeToString(),
+                 1 if may_have_applied else 0, now_unix_ms()))
+            if vehicle_version is not None:
+                self._db.execute(
+                    "INSERT OR REPLACE INTO versions VALUES (?, ?)",
+                    (ack.vehicle_id, vehicle_version))
+        self.prune()
 
     def lookup(self, operation_id):
         with self._lock:
-            return self._acks_by_operation.get(operation_id)
+            row = self._db.execute(
+                "SELECT ack FROM acks WHERE operation_id = ?",
+                (operation_id,)).fetchone()
+        if row is None:
+            return None
+        ack = vehicle_pb2.CommandAck()
+        ack.ParseFromString(row[0])
+        return ack
 
     def must_replay(self, operation_id):
         """True if re-executing this operation could apply it twice."""
         with self._lock:
-            return operation_id in self._may_have_applied
+            row = self._db.execute(
+                "SELECT may_have_applied FROM acks WHERE operation_id = ?",
+                (operation_id,)).fetchone()
+        return bool(row and row[0])
+
+    def versions(self):
+        """Each vehicle's last state_version, so a restart carries on counting."""
+        with self._lock:
+            return dict(self._db.execute(
+                "SELECT vehicle_id, state_version FROM versions").fetchall())
+
+    def prune(self):
+        cutoff = now_unix_ms() - int(self.horizon_s * 1000)
+        with self._lock, self._db:
+            self._db.execute("DELETE FROM acks WHERE recorded_at_ms < ?",
+                             (cutoff,))
+
+    def close(self):
+        with self._lock:
+            self._db.close()
 
     def replay(self, original_ack):
         """The answer to a duplicate: the original outcome, marked as a repeat.
@@ -321,33 +400,105 @@ class MavlinkBridge:
     mavlink-router multiplexes every copter onto a single TCP port and tells
     them apart by system id, so the gateway keeps one socket and demultiplexes
     on srcSystem. Sends are serialised with a lock; reads happen only here.
+
+    When the link dies (the router closes the connection, or nothing at all
+    arrives for TELEMETRY_STALE_AFTER_S) the reader says LINK DOWN, and then
+    reconnects on its own: one attempt every RECONNECT_INTERVAL_S until a
+    heartbeat comes back, then the stream request again, because a router or
+    simulator that restarted has forgotten the last one. It used to say LINK
+    DOWN and wait for a person to restart the gateway, while pymavlink printed
+    "EOF on TCP socket" in a tight loop.
     """
 
     def __init__(self, connection_string, vehicles):
+        self.connection_string = connection_string
         self.vehicles_by_id = vehicles
         self.vehicles_by_system = {v.system_id: v for v in vehicles.values()}
         self._send_lock = threading.Lock()
         self._pending_acks = {}
         self._pending_lock = threading.Lock()
         self._running = True
+        self.link_up = False
+        self._down_since = None
 
         log(f"connecting to {connection_string} ...")
-        self.link = mavutil.mavlink_connection(connection_string)
-        self.link.wait_heartbeat()
-        log(f"heartbeat from system {self.link.target_system}")
-
-        # ArduPilot streams nothing until a ground station asks, so a gateway
-        # that skips this sees no position and reports a vehicle that is fine
-        # as missing.
-        for system_id in self.vehicles_by_system:
-            self.link.mav.request_data_stream_send(
-                system_id, 1, mavutil.mavlink.MAV_DATA_STREAM_ALL, 5, 1)
+        # At startup there is nothing to recover, so wait as long as it takes.
+        self.link = self._connect(retries=6, heartbeat_wait_s=None)
+        self.link_up = True
 
         threading.Thread(target=self._read_forever, daemon=True).start()
         threading.Thread(target=self._heartbeat_forever, daemon=True).start()
 
     def stop(self):
         self._running = False
+
+    # -- the connection -----------------------------------------------------
+
+    def _connect(self, retries, heartbeat_wait_s):
+        """Open the router connection, wait for a heartbeat, request streams.
+
+        Returns the link, or raises if either the connection or the heartbeat
+        does not arrive.
+        """
+        link = mavutil.mavlink_connection(self.connection_string,
+                                          retries=retries)
+        # pymavlink reacts to a closed TCP connection by printing and trying
+        # again inside recv, forever. Losing the link is the reader's decision
+        # to report and act on, so both hooks just raise the flag.
+        link.handle_eof = lambda: self._lose("the router closed the connection")
+        link.handle_disconnect = lambda: self._lose("the connection was reset")
+        heartbeat = link.wait_heartbeat(timeout=heartbeat_wait_s)
+        if heartbeat is None:
+            link.close()
+            raise ConnectionError("connected, but no heartbeat arrived")
+        log(f"heartbeat from system {link.target_system}")
+        # The heartbeat that proved the link is also the vehicle's first word
+        # about its mode and armed state; drop it and the gateway judges the
+        # next command against defaults.
+        vehicle = self.vehicles_by_system.get(heartbeat.get_srcSystem())
+        if vehicle is not None:
+            self._apply(vehicle, heartbeat)
+
+        # ArduPilot streams nothing until a ground station asks, so a gateway
+        # that skips this sees no position and reports a vehicle that is fine
+        # as missing.
+        for system_id in self.vehicles_by_system:
+            link.mav.request_data_stream_send(
+                system_id, 1, mavutil.mavlink.MAV_DATA_STREAM_ALL, 5, 1)
+        return link
+
+    def _lose(self, why):
+        if self.link_up:
+            self.link_up = False
+            self._down_since = time.time()
+            # What we knew about each vehicle is from before the drop. Until
+            # it speaks again it is not heard from, so telemetry for it stops
+            # and commands for it are refused, rather than either running on
+            # a picture that may be minutes old by the time the link returns.
+            for vehicle in self.vehicles_by_id.values():
+                with vehicle.lock:
+                    vehicle.heard_from = False
+                    vehicle.position_known = False
+            log(f"  LINK DOWN: {why}. Reconnecting every "
+                f"{RECONNECT_INTERVAL_S:g}s.")
+
+    def _recover(self):
+        """One reconnection attempt. Returns True once the link is back."""
+        try:
+            fresh = self._connect(retries=0,
+                                  heartbeat_wait_s=RECONNECT_HEARTBEAT_WAIT_S)
+        except (OSError, ConnectionError):
+            time.sleep(RECONNECT_INTERVAL_S)
+            return False
+        with self._send_lock:
+            old, self.link = self.link, fresh
+        try:
+            old.close()
+        except Exception:
+            pass
+        self.link_up = True
+        log(f"  LINK UP after {time.time() - self._down_since:.1f}s")
+        return True
 
     def _heartbeat_forever(self):
         """Announce that we are still here, once a second.
@@ -361,6 +512,9 @@ class MavlinkBridge:
         """
         interval = 1.0 / HEARTBEAT_HZ
         while self._running:
+            if not self.link_up:
+                time.sleep(interval)
+                continue
             try:
                 with self._send_lock:
                     self.link.mav.heartbeat_send(
@@ -374,21 +528,25 @@ class MavlinkBridge:
 
     def _read_forever(self):
         last_message_at = time.time()
-        complained = False
         while self._running:
-            message = self.link.recv_match(blocking=True, timeout=0.5)
+            if not self.link_up:
+                if self._recover():
+                    last_message_at = time.time()
+                continue
+            try:
+                message = self.link.recv_match(blocking=True, timeout=0.5)
+            except Exception as error:
+                self._lose(f"reading failed ({error})")
+                continue
             if message is None:
                 # recv_match returns None both for an idle link and for one
-                # whose far end has gone away. Only the clock tells them apart.
-                if (not complained
-                        and time.time() - last_message_at > TELEMETRY_STALE_AFTER_S):
-                    complained = True
-                    log("  LINK DOWN: no MAVLink of any kind. The router or "
-                        "the simulator has gone away; restart the gateway "
-                        "once it is back.")
+                # whose far end has gone away without closing it. Only the
+                # clock tells them apart.
+                if time.time() - last_message_at > TELEMETRY_STALE_AFTER_S:
+                    self._lose(f"no MAVLink of any kind for "
+                               f"{TELEMETRY_STALE_AFTER_S:g}s")
                 continue
             last_message_at = time.time()
-            complained = False
             vehicle = self.vehicles_by_system.get(message.get_srcSystem())
             if vehicle is None:
                 continue                    # another copter on the same router
@@ -410,6 +568,7 @@ class MavlinkBridge:
             vehicle.last_message_at = time.time()
             vehicle.sampled_at_unix_ms = now_unix_ms()
             if message_type == 'GLOBAL_POSITION_INT':
+                vehicle.position_known = True
                 vehicle.latitude_deg = message.lat / DEGREES_TO_MAVLINK_INT
                 vehicle.longitude_deg = message.lon / DEGREES_TO_MAVLINK_INT
                 vehicle.altitude_m = message.relative_alt / 1000.0
@@ -520,6 +679,14 @@ class Gateway:
         self.telemetry_addresses = list(telemetry_addresses)
         self.link = link
         self._running = True
+        # Carry on counting where the last process stopped. An approval bound
+        # to version 7 must not find the vehicle at 0 after a restart.
+        restored = ledger.versions()
+        for vehicle in bridge.vehicles_by_id.values():
+            if vehicle.vehicle_id in restored:
+                vehicle.state_version = restored[vehicle.vehicle_id]
+                log(f"  {vehicle.vehicle_id} resumes at state_version "
+                    f"{vehicle.state_version}")
 
     def serve_forever(self):
         threading.Thread(target=self._broadcast_telemetry, daemon=True).start()
@@ -540,7 +707,7 @@ class Gateway:
         while self._running:
             for vehicle in self.bridge.vehicles_by_id.values():
                 with vehicle.lock:
-                    if not vehicle.heard_from:
+                    if not (vehicle.heard_from and vehicle.position_known):
                         continue
                     silent_for = time.time() - vehicle.last_message_at
 
@@ -670,6 +837,30 @@ class Gateway:
                          reply_address)
             return
 
+        # A command sent into a dead link would time out and be recorded as
+        # possibly applied, and then replayed forever. Refuse it before
+        # anything is sent, so the refusal is definite and a retry after the
+        # link returns is evaluated fresh.
+        if not getattr(self.bridge, "link_up", True):
+            self._finish(command, vehicle_pb2.REJECTED_RETRYABLE,
+                         "the MAVLink link to the vehicles is down and the "
+                         "gateway is reconnecting; nothing was sent. Retry "
+                         "once telemetry resumes.",
+                         current_version, reply_address)
+            return
+
+        with vehicle.lock:
+            heard = vehicle.heard_from
+        if not heard:
+            # Mode and armed state are defaults until the vehicle speaks, and
+            # a command judged against defaults gets a wrong reason back.
+            self._finish(command, vehicle_pb2.REJECTED_RETRYABLE,
+                         f"no telemetry from {command.vehicle_id} yet since "
+                         f"the gateway (re)connected; nothing was sent. Retry "
+                         f"once telemetry for it arrives.",
+                         current_version, reply_address)
+            return
+
         # 4. Do things
         status, reason = self._execute(action, command, vehicle)
         may_have_applied = status in (vehicle_pb2.ACCEPTED, UNCONFIRMED)
@@ -686,10 +877,11 @@ class Gateway:
 
         # state_version moves only when the vehicle actually took the command,
         # so a client can count accepted writes and compare.
-        version = (vehicle.bump_state_version() if status == vehicle_pb2.ACCEPTED
-                   else current_version)
+        accepted = status == vehicle_pb2.ACCEPTED
+        version = vehicle.bump_state_version() if accepted else current_version
         self._finish(command, status, reason, version, reply_address,
-                     may_have_applied=may_have_applied)
+                     may_have_applied=may_have_applied,
+                     moved_version=accepted)
 
     def _execute(self, action, command, vehicle):
         if action == 'arm':
@@ -808,7 +1000,7 @@ class Gateway:
         return status, f"vehicle answered {name} to {what}"
 
     def _finish(self, command, status, reason, state_version, reply_address,
-                may_have_applied=False):
+                may_have_applied=False, moved_version=False):
         ack = vehicle_pb2.CommandAck(
             operation_id=command.operation_id,
             vehicle_id=command.vehicle_id,
@@ -819,7 +1011,9 @@ class Gateway:
         )
         # Recorded BEFORE it is sent. If the send is dropped the gateway must
         # still be able to answer "what happened to this operation?"
-        self.ledger.remember(ack, may_have_applied)
+        self.ledger.remember(ack, may_have_applied,
+                             vehicle_version=state_version if moved_version
+                             else None)
         log(f"  -> {vehicle_pb2.CommandStatus.Name(status)}: {reason}")
         self._reply(ack, reply_address, droppable=True)
 
@@ -854,6 +1048,9 @@ def main():
     parser.add_argument('--vehicle', type=parse_vehicle, action='append',
                         metavar='NAME=SYSID',
                         help='repeatable; default: copter_1=1 copter_2=2')
+    parser.add_argument('--ledger', default=str(DEFAULT_LEDGER_PATH),
+                        help='SQLite file for the op_id ledger and state '
+                             'versions; survives restarts (default: %(default)s)')
 
     faults = parser.add_argument_group('link faults')
     faults.add_argument('--drop-first-ack', action='store_true',
@@ -901,8 +1098,9 @@ def main():
                                         "127.0.0.1:14553"]):
         host, _, port = entry.rpartition(":")
         destinations.append((host or "127.0.0.1", int(port)))
-    gateway = Gateway(bridge, CommandLedger(), args.command_port,
-                      destinations, link)
+    ledger = CommandLedger(args.ledger)
+    log(f"ledger {ledger.path}, horizon {ledger.horizon_s / 3600:g} h")
+    gateway = Gateway(bridge, ledger, args.command_port, destinations, link)
 
     for name, state in vehicles.items():
         log(f"serving {name} as MAVLink system {state.system_id}")

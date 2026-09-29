@@ -22,7 +22,7 @@ started).
 ## 1. Where it is now
 
 Built over one weekend against ArduPilot SITL. ~6,700 lines of Python,
-149 unit tests passing in ~20 s with no Docker, 12 end-to-end missions graded
+166 unit tests passing in ~25 s with no Docker, 12 end-to-end missions graded
 from traces rather than from the model's summary.
 
 | Component | State | Note |
@@ -36,8 +36,8 @@ from traces rather than from the model's summary.
 | `harness/loop` — direct agent loop | DONE | Budget-guarded. No approval gate; for observation only |
 | `evals` — three verdicts, offline re-grading | DONE | pass / correctly-declined / fail. 12 visible cases, 5 held out |
 | `observability` — traces + telemetry → MCAP | DONE | Agent decisions and vehicle behaviour on one clock in Foxglove |
-| Gateway dedup ledger durability | PARTIAL | In memory. A restart forgets every `op_id` |
-| MAVLink reconnection | PARTIAL | Says `LINK DOWN` instead of serving stale state, but needs a manual restart |
+| Gateway dedup ledger durability | DONE | SQLite, 24 h horizon, `state_version` persisted with each accepted ack. Tested by SIGKILLing the gateway mid-mission: no duplicate dispatch |
+| MAVLink reconnection | DONE | Reconnects on its own and re-requests streams. Recovery bound 10 s; measured 0.7 s against the test router, 1.7 s against the live stack |
 | Fleet concurrency | PARTIAL | Missions are sequential; `wait_for_*` blocks |
 | Operator interface | PARTIAL | CLI prompt. One operator, no authority model |
 | Battery / range limits | NEW | No constraint exists; a model can fly a 0% aircraft |
@@ -125,7 +125,7 @@ which is the whole argument for building the rover first. Group E is the only
 part that differs by vehicle.
 
 **A. Harden what exists (all doable in SITL, no hardware)**
-1. Persist the gateway ledger with a bounded horizon; add MAVLink reconnection.
+1. ~~Persist the gateway ledger with a bounded horizon; add MAVLink reconnection.~~ Done 2026-09-28.
 2. Flight state machine — transitions as data, `request_mode` as a guarded
    write tool, one test per transition row. DESIGNED; highest value before any
    hardware arrives.

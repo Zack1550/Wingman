@@ -9,6 +9,9 @@ __pycache__/
 # The harness's durable ledger. Real mission state, not source.
 mission_store.sqlite3
 mission_store.sqlite3-*
+# The gateway's op_id ledger and state versions: vehicle-side state, not source.
+gateway_ledger.sqlite3
+gateway_ledger.sqlite3-*
 
 # Run traces. Useful evidence but they pile up fast; force-add an exemplar
 # with `git add -f traces/<one>.jsonl` if you want one in the README.
